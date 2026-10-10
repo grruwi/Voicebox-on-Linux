@@ -66,7 +66,8 @@ Adres bazowy `http://<host>:17493/v1`, klucz API dowolny (nie jest sprawdzany).
 | `GET /v1/audio/models` | jeden model `voicebox` |
 
 `model` i `speed` są ignorowane: silnik (Vox albo OmniVoice) bierze się z profilu,
-a tempo i reszta pokręteł z panelu. `instructions` (opis stylu) działa tylko z Voxem.
+a tempo i reszta pokręteł z panelu. `instructions`: dla Voxa opis stylu (np. „szeptem”),
+dla OmniVoice opis głosu (płeć, wiek, wysokość, akcent).
 
 ```bash
 curl http://<host>:17493/v1/audio/speech -H 'Content-Type: application/json' \

@@ -12,7 +12,8 @@ w services/generation.py i AGENT_SOURCES we froncie.
 
 `voice` = nazwa profilu (bez rozrozniania wielkosci liter). Puste = profil
 domyslny z panelu MCP. `model` ignorowany — silnik bierze sie z profilu.
-`instructions` = nawias Voxa: idzie przed tekst jako `(…)`.
+`instructions` = nawias Voxa (`(…)` przed tekstem) — TYLKO dla profili na voxie.
+OmniVoice i reszta dostaja je polem `instruct` (Omni: opis glosu), nigdy w tekscie.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ FORMATY = {
 
 # Limit nawiasu Voxa — dluzszy backend nie wykryje i po cichu wraca kontynuacja.
 NAWIAS_MAX = 200
+# `GenerationRequest.instruct` (models.py, max_length)
+INSTRUCT_MAX = 500
 
 
 class SpeechRequest(BaseModel):
@@ -138,13 +141,24 @@ async def speech(data: SpeechRequest, db: Session = Depends(get_db)):
         )
 
     instrukcja = (data.instructions or "").strip()
-    if instrukcja:
+    # Silnik jak w `_resolve_generation_engine` (engine=None nizej): nawias rozumie tylko vox —
+    # OmniVoice przeczytalby go na glos, wiec dostaje instrukcje osobnym polem.
+    silnik = getattr(profil, "default_engine", None) or getattr(profil, "preset_engine", None) or ""
+    instruct = None
+    if instrukcja and silnik.startswith("voxcpm"):
         if len(instrukcja) > NAWIAS_MAX:
             raise HTTPException(
                 status_code=400,
                 detail=f"`instructions` ma {len(instrukcja)} znakow, Vox czyta nawias do {NAWIAS_MAX}.",
             )
         tekst = f"({instrukcja}){tekst}"
+    elif instrukcja:
+        if len(instrukcja) > INSTRUCT_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"`instructions` ma {len(instrukcja)} znakow, limit {INSTRUCT_MAX}.",
+            )
+        instruct = instrukcja
 
     from .generations import generate_speech
 
@@ -158,6 +172,7 @@ async def speech(data: SpeechRequest, db: Session = Depends(get_db)):
                 text=tekst,
                 language=profil.language or "en",
                 engine=None,
+                instruct=instruct,
                 **_ustawienia_panelu(db),
             ),
             db,
