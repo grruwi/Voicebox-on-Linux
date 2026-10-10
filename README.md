@@ -94,5 +94,4 @@ Inne karty: `ROCM_RODZINY` i `GPU_TARGETS` w `docker-compose.rocm.yml`.
 
 ## Autorzy
 
-Złożył [grruwi](https://github.com/grruwi) razem z Claude (Claude Code, Anthropic) —
-łatki silnika, kontenery i przeróbki Voiceboxa powstawały we dwóch.
+Złożył [grruwi](https://github.com/grruwi) z Claude
