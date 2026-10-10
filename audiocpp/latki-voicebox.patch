@@ -1,0 +1,2146 @@
+diff --git a/app/server/parallel_runtime.cpp b/app/server/parallel_runtime.cpp
+index 1e2d2fe..80de85b 100644
+--- a/app/server/parallel_runtime.cpp
++++ b/app/server/parallel_runtime.cpp
+@@ -486,6 +486,65 @@ std::vector<uint8_t> encode_pcm16_samples(const engine::runtime::AudioBuffer & a
+     return out;
+ }
+ 
++// Voicebox: `"sample_format": "f32"` = próbki float32 LE prosto z AudioVAE,
++// bez obcinania do [-1, 1] i bez kwantyzacji do 16 bitów. WAV dostaje
++// WAVE_FORMAT_IEEE_FLOAT (3). Domyślnie "s16", jak upstream. Odpowiedź niesie
++// nagłówek X-Sample-Format, żeby klient nie zgadywał formatu gołego PCM.
++bool wants_f32_samples(const Value & body) {
++    const auto format = engine::io::json::optional_string(body, "sample_format", "s16");
++    if (format != "s16" && format != "f32") {
++        throw std::runtime_error("sample_format must be s16 or f32");
++    }
++    return format == "f32";
++}
++
++std::vector<uint8_t> encode_f32_samples(const engine::runtime::AudioBuffer & audio) {
++    if (audio.sample_rate <= 0) {
++        throw std::runtime_error("audio output sample rate must be positive");
++    }
++    if (audio.channels <= 0) {
++        throw std::runtime_error("audio output channel count must be positive");
++    }
++    if (audio.samples.size() % static_cast<size_t>(audio.channels) != 0) {
++        throw std::runtime_error("audio output sample count must be divisible by channel count");
++    }
++    const auto * bytes = reinterpret_cast<const uint8_t *>(audio.samples.data());
++    return std::vector<uint8_t>(bytes, bytes + audio.samples.size() * sizeof(float));
++}
++
++std::vector<uint8_t> encode_f32_wav(const engine::runtime::AudioBuffer & audio) {
++    const auto samples = encode_f32_samples(audio);
++    const uint16_t channels = static_cast<uint16_t>(audio.channels);
++    const uint16_t bits_per_sample = 32;
++    const uint32_t data_bytes = static_cast<uint32_t>(samples.size());
++    const uint32_t byte_rate = static_cast<uint32_t>(audio.sample_rate) * channels * bits_per_sample / 8;
++    const uint16_t block_align = channels * bits_per_sample / 8;
++
++    std::vector<uint8_t> out;
++    out.reserve(44 + data_bytes);
++    auto append_bytes = [&](const void * data, size_t size) {
++        const auto * bytes = static_cast<const uint8_t *>(data);
++        out.insert(out.end(), bytes, bytes + size);
++    };
++    auto append_u16 = [&](uint16_t value) { append_bytes(&value, sizeof(value)); };
++    auto append_u32 = [&](uint32_t value) { append_bytes(&value, sizeof(value)); };
++
++    out.insert(out.end(), {'R', 'I', 'F', 'F'});
++    append_u32(36 + data_bytes);
++    out.insert(out.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
++    append_u32(16);
++    append_u16(3);
++    append_u16(channels);
++    append_u32(static_cast<uint32_t>(audio.sample_rate));
++    append_u32(byte_rate);
++    append_u16(block_align);
++    append_u16(bits_per_sample);
++    out.insert(out.end(), {'d', 'a', 't', 'a'});
++    append_u32(data_bytes);
++    out.insert(out.end(), samples.begin(), samples.end());
++    return out;
++}
++
+ void write_sse(HttpStreamWriter & writer, const std::string & json) {
+     writer.write("data: " + json + "\n\n");
+ }
+@@ -2520,11 +2579,12 @@ HttpResponse ParallelServerState::handle_speech(const std::string & body_text) {
+     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
+         return handle_speech_stream(model, request, body, request_lease);
+     }
++    const bool f32 = wants_f32_samples(body);
+     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
+         ? run_streaming_model(model, request, {}, busy_timeout_ms, request_lease)
+         : run_model(model, request, busy_timeout_ms, request_lease);
+     const auto & audio = select_audio_output(timed_result.result);
+-    const auto wav = encode_pcm16_wav(audio);
++    const auto wav = f32 ? encode_f32_wav(audio) : encode_pcm16_wav(audio);
+     const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
+     if (response_format == "json" || response_format == "b64_json") {
+         return json_response(
+@@ -2536,6 +2596,7 @@ HttpResponse ParallelServerState::handle_speech(const std::string & body_text) {
+     response.content_type = "audio/wav";
+     response.body = std::string(reinterpret_cast<const char *>(wav.data()), wav.size());
+     response.headers = timing_headers(timed_result.wall_ms, audio);
++    response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
+     return response;
+ }
+ 
+@@ -2556,9 +2617,11 @@ HttpResponse ParallelServerState::handle_speech_stream(
+         throw std::runtime_error("streaming speech stream_format must be sse or audio");
+     }
+ 
++    const bool f32 = wants_f32_samples(body);
++    const auto encode = f32 ? &encode_f32_samples : &encode_pcm16_samples;
+     const auto busy_timeout_ms = parse_busy_timeout_override(body);
+     LoadedModel * model_ptr = &model;
+-    auto stream_body = [this, model_ptr, request, busy_timeout_ms, request_lease](HttpStreamWriter & writer) {
++    auto stream_body = [this, model_ptr, request, busy_timeout_ms, request_lease, encode](HttpStreamWriter & writer) {
+         bool wrote_audio = false;
+         const auto timed_result = run_streaming_model(
+             *model_ptr,
+@@ -2572,7 +2635,7 @@ HttpResponse ParallelServerState::handle_speech_stream(
+                     buffers.push_back(named.audio);
+                 }
+                 for (const auto & audio : buffers) {
+-                    const auto pcm = encode_pcm16_samples(audio);
++                    const auto pcm = encode(audio);
+                     write_sse(
+                         writer,
+                         "{\"type\":\"speech.audio.delta\",\"audio\":" +
+@@ -2593,21 +2656,23 @@ HttpResponse ParallelServerState::handle_speech_stream(
+         write_sse_done(writer);
+     };
+     if (stream_format == "sse") {
+-        return sse_response(std::move(stream_body));
++        auto response = sse_response(std::move(stream_body));
++        response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
++        return response;
+     }
+-    return chunked_audio_response([this, model_ptr, request, busy_timeout_ms, request_lease](HttpStreamWriter & writer) {
++    auto response = chunked_audio_response([this, model_ptr, request, busy_timeout_ms, request_lease, encode](HttpStreamWriter & writer) {
+         bool wrote_audio = false;
+         (void)run_streaming_model(
+             *model_ptr,
+             request,
+             [&](const engine::runtime::StreamEvent & event) {
+                 if (event.audio_output.has_value()) {
+-                    const auto pcm = encode_pcm16_samples(*event.audio_output);
++                    const auto pcm = encode(*event.audio_output);
+                     writer.write(std::string(reinterpret_cast<const char *>(pcm.data()), pcm.size()));
+                     wrote_audio = true;
+                 }
+                 for (const auto & named : event.named_audio_outputs) {
+-                    const auto pcm = encode_pcm16_samples(named.audio);
++                    const auto pcm = encode(named.audio);
+                     writer.write(std::string(reinterpret_cast<const char *>(pcm.data()), pcm.size()));
+                     wrote_audio = true;
+                 }
+@@ -2617,6 +2682,8 @@ HttpResponse ParallelServerState::handle_speech_stream(
+             throw std::runtime_error("streaming speech model produced no audio delta events");
+         }
+     });
++    response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
++    return response;
+ }
+ 
+ HttpResponse ParallelServerState::handle_speech_live(const HttpRequest & request) {
+@@ -4107,7 +4174,7 @@ void ParallelServerState::unload_registered_models(
+     {
+         std::lock_guard<std::mutex> admission_lock(bulk_admission_mutex_);
+         for (const auto & [id, model] : registered) {
+-            if (std::any_of(parallel.begin(), parallel.end(), [model](const Drain & d) { return d.model == model; })) {
++            if (std::any_of(parallel.begin(), parallel.end(), [m = model](const Drain & d) { return d.model == m; })) {
+                 continue;
+             }
+             parallel.push_back({id, model, model->busy.queue_management(0, id)});
+diff --git a/app/server/runtime.cpp b/app/server/runtime.cpp
+index 4cbb0bf..14c7777 100644
+--- a/app/server/runtime.cpp
++++ b/app/server/runtime.cpp
+@@ -477,6 +477,65 @@ std::vector<uint8_t> encode_pcm16_samples(const engine::runtime::AudioBuffer & a
+     return out;
+ }
+ 
++// Voicebox (kopia z parallel_runtime.cpp — Voicebox chodzi BEZ --parallel-jobs): `"sample_format": "f32"` = próbki float32 LE prosto z AudioVAE,
++// bez obcinania do [-1, 1] i bez kwantyzacji do 16 bitów. WAV dostaje
++// WAVE_FORMAT_IEEE_FLOAT (3). Domyślnie "s16", jak upstream. Odpowiedź niesie
++// nagłówek X-Sample-Format, żeby klient nie zgadywał formatu gołego PCM.
++bool wants_f32_samples(const Value & body) {
++    const auto format = engine::io::json::optional_string(body, "sample_format", "s16");
++    if (format != "s16" && format != "f32") {
++        throw std::runtime_error("sample_format must be s16 or f32");
++    }
++    return format == "f32";
++}
++
++std::vector<uint8_t> encode_f32_samples(const engine::runtime::AudioBuffer & audio) {
++    if (audio.sample_rate <= 0) {
++        throw std::runtime_error("audio output sample rate must be positive");
++    }
++    if (audio.channels <= 0) {
++        throw std::runtime_error("audio output channel count must be positive");
++    }
++    if (audio.samples.size() % static_cast<size_t>(audio.channels) != 0) {
++        throw std::runtime_error("audio output sample count must be divisible by channel count");
++    }
++    const auto * bytes = reinterpret_cast<const uint8_t *>(audio.samples.data());
++    return std::vector<uint8_t>(bytes, bytes + audio.samples.size() * sizeof(float));
++}
++
++std::vector<uint8_t> encode_f32_wav(const engine::runtime::AudioBuffer & audio) {
++    const auto samples = encode_f32_samples(audio);
++    const uint16_t channels = static_cast<uint16_t>(audio.channels);
++    const uint16_t bits_per_sample = 32;
++    const uint32_t data_bytes = static_cast<uint32_t>(samples.size());
++    const uint32_t byte_rate = static_cast<uint32_t>(audio.sample_rate) * channels * bits_per_sample / 8;
++    const uint16_t block_align = channels * bits_per_sample / 8;
++
++    std::vector<uint8_t> out;
++    out.reserve(44 + data_bytes);
++    auto append_bytes = [&](const void * data, size_t size) {
++        const auto * bytes = static_cast<const uint8_t *>(data);
++        out.insert(out.end(), bytes, bytes + size);
++    };
++    auto append_u16 = [&](uint16_t value) { append_bytes(&value, sizeof(value)); };
++    auto append_u32 = [&](uint32_t value) { append_bytes(&value, sizeof(value)); };
++
++    out.insert(out.end(), {'R', 'I', 'F', 'F'});
++    append_u32(36 + data_bytes);
++    out.insert(out.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
++    append_u32(16);
++    append_u16(3);
++    append_u16(channels);
++    append_u32(static_cast<uint32_t>(audio.sample_rate));
++    append_u32(byte_rate);
++    append_u16(block_align);
++    append_u16(bits_per_sample);
++    out.insert(out.end(), {'d', 'a', 't', 'a'});
++    append_u32(data_bytes);
++    out.insert(out.end(), samples.begin(), samples.end());
++    return out;
++}
++
+ void write_sse(HttpStreamWriter & writer, const std::string & json) {
+     writer.write("data: " + json + "\n\n");
+ }
+@@ -2388,12 +2447,13 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
+     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
+         return handle_speech_stream(model, request, body);
+     }
++    const bool f32 = wants_f32_samples(body);
+     const auto busy_timeout_ms = parse_busy_timeout_override(body);
+     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
+         ? run_streaming_model(model, request, {}, busy_timeout_ms)
+         : run_model(model, request, busy_timeout_ms);
+     const auto & audio = select_audio_output(timed_result.result);
+-    const auto wav = encode_pcm16_wav(audio);
++    const auto wav = f32 ? encode_f32_wav(audio) : encode_pcm16_wav(audio);
+     const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
+     if (response_format == "json" || response_format == "b64_json") {
+         return json_response(
+@@ -2405,6 +2465,7 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
+     response.content_type = "audio/wav";
+     response.body = std::string(reinterpret_cast<const char *>(wav.data()), wav.size());
+     response.headers = timing_headers(timed_result.wall_ms, audio);
++    response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
+     return response;
+ }
+ 
+@@ -2424,9 +2485,11 @@ HttpResponse ServerState::handle_speech_stream(
+         throw std::runtime_error("streaming speech stream_format must be sse or audio");
+     }
+ 
++    const bool f32 = wants_f32_samples(body);
++    const auto encode = f32 ? &encode_f32_samples : &encode_pcm16_samples;
+     const auto busy_timeout_ms = parse_busy_timeout_override(body);
+     LoadedModel * model_ptr = &model;
+-    auto stream_body = [this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
++    auto stream_body = [this, model_ptr, request, busy_timeout_ms, encode](HttpStreamWriter & writer) {
+         bool wrote_audio = false;
+         const auto timed_result = run_streaming_model(
+             *model_ptr,
+@@ -2440,7 +2503,7 @@ HttpResponse ServerState::handle_speech_stream(
+                     buffers.push_back(named.audio);
+                 }
+                 for (const auto & audio : buffers) {
+-                    const auto pcm = encode_pcm16_samples(audio);
++                    const auto pcm = encode(audio);
+                     write_sse(
+                         writer,
+                         "{\"type\":\"speech.audio.delta\",\"audio\":" +
+@@ -2461,21 +2524,23 @@ HttpResponse ServerState::handle_speech_stream(
+         write_sse_done(writer);
+     };
+     if (stream_format == "sse") {
+-        return sse_response(std::move(stream_body));
++        auto response = sse_response(std::move(stream_body));
++        response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
++        return response;
+     }
+-    return chunked_audio_response([this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
++    auto response = chunked_audio_response([this, model_ptr, request, busy_timeout_ms, encode](HttpStreamWriter & writer) {
+         bool wrote_audio = false;
+         (void)run_streaming_model(
+             *model_ptr,
+             request,
+             [&](const engine::runtime::StreamEvent & event) {
+                 if (event.audio_output.has_value()) {
+-                    const auto pcm = encode_pcm16_samples(*event.audio_output);
++                    const auto pcm = encode(*event.audio_output);
+                     writer.write(std::string(reinterpret_cast<const char *>(pcm.data()), pcm.size()));
+                     wrote_audio = true;
+                 }
+                 for (const auto & named : event.named_audio_outputs) {
+-                    const auto pcm = encode_pcm16_samples(named.audio);
++                    const auto pcm = encode(named.audio);
+                     writer.write(std::string(reinterpret_cast<const char *>(pcm.data()), pcm.size()));
+                     wrote_audio = true;
+                 }
+@@ -2485,6 +2550,8 @@ HttpResponse ServerState::handle_speech_stream(
+             throw std::runtime_error("streaming speech model produced no audio delta events");
+         }
+     });
++    response.headers["X-Sample-Format"] = f32 ? "f32" : "s16";
++    return response;
+ }
+ 
+ HttpResponse ServerState::handle_speech_live(const HttpRequest & request) {
+diff --git a/include/engine/framework/assets/tensor_source.h b/include/engine/framework/assets/tensor_source.h
+index 12321a5..051e324 100644
+--- a/include/engine/framework/assets/tensor_source.h
++++ b/include/engine/framework/assets/tensor_source.h
+@@ -127,6 +127,8 @@ public:
+     [[nodiscard]] virtual int64_t require_i64_scalar(std::string_view name) const = 0;
+ };
+ 
++// Voicebox: zwalnia przypiety bufor, przez ktory wagi ida na karte (wolac po ladowaniu).
++void release_upload_staging();
+ [[nodiscard]] TensorStorageType parse_tensor_storage_type(std::string_view value);
+ [[nodiscard]] ggml_type ggml_type_for_tensor_dtype(std::string_view dtype);
+ [[nodiscard]] ggml_type ggml_type_for_tensor_storage(TensorStorageType storage_type);
+diff --git a/include/engine/framework/core/backend_weight_store.h b/include/engine/framework/core/backend_weight_store.h
+index 6e09b46..0e41356 100644
+--- a/include/engine/framework/core/backend_weight_store.h
++++ b/include/engine/framework/core/backend_weight_store.h
+@@ -189,6 +189,7 @@ public:
+         }
+         pending_.clear();
+         pending_.shrink_to_fit();
++        assets::release_upload_staging();
+     }
+ 
+ private:
+diff --git a/include/engine/framework/runtime/kv_cache.h b/include/engine/framework/runtime/kv_cache.h
+index 19c1223..62ceacc 100644
+--- a/include/engine/framework/runtime/kv_cache.h
++++ b/include/engine/framework/runtime/kv_cache.h
+@@ -2,6 +2,8 @@
+ 
+ #include "engine/framework/core/module.h"
+ 
++#include <ggml-backend.h>
++
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -57,6 +59,14 @@ public:
+         TransformerKVCacheOptions options);
+ 
+     void import_state(const TransformerKVState & state);
++    // Voicebox: prefiks KV prosto z tensorów na tym samym backendzie (np. wyjść
++    // prefillu), bez rundy przez CPU. Źródło: ciągłe, ≥ steps * step_elems
++    // elementów na warstwę, dowolny typ zmiennoprzecinkowy; reszta cache = 0.
++    void import_prefix_from_backend(
++        ggml_backend_t backend,
++        const std::vector<ggml_tensor *> & keys,
++        const std::vector<ggml_tensor *> & values,
++        int64_t steps);
+     void clear_on_backend();
+     TransformerKVState export_state() const;
+ 
+diff --git a/include/engine/models/voxcpm2/audiovae.h b/include/engine/models/voxcpm2/audiovae.h
+index e7dbdbb..0d493e0 100644
+--- a/include/engine/models/voxcpm2/audiovae.h
++++ b/include/engine/models/voxcpm2/audiovae.h
+@@ -43,6 +43,10 @@ public:
+       const std::string &prompt_text,
+       const std::optional<runtime::AudioBuffer> &reference_audio);
+   void release_runtime_memory();
++  // Stanowy dekoder strumienia: każda konwolucja przyczynowa pamięta ogon
++  // poprzedniego kawałka, więc strumień = dekodowanie całości jednym przebiegiem.
++  void stream_begin();
++  runtime::AudioBuffer decode_stream_patch(const std::vector<float> &features);
+ 
+ private:
+   class Impl;
+diff --git a/include/engine/models/voxcpm2/generator.h b/include/engine/models/voxcpm2/generator.h
+index a14d890..9cfe906 100644
+--- a/include/engine/models/voxcpm2/generator.h
++++ b/include/engine/models/voxcpm2/generator.h
+@@ -6,6 +6,7 @@
+ #include <cstddef>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ namespace engine::core {
+@@ -24,9 +25,15 @@ struct VoxCPM2FeatureGeneratorConfig {
+   size_t local_encoder_graph_context_bytes = 512ull * 1024ull * 1024ull;
+   size_t dit_graph_context_bytes = 1024ull * 1024ull * 1024ull;
+   size_t prompt_cache_slots = 1;
++  // Voicebox: katalog cache próbek na dysku (`voxcpm2.prompt_disk_cache_dir`),
++  // wspólny dla sesji (cechy AudioVAE) i generatora (embeddingi). Puste = brak.
++  std::string prompt_disk_cache_dir;
+   bool mem_saver = true;
+   engine::assets::TensorStorageType weight_storage_type =
+       engine::assets::TensorStorageType::Native;
++  // Voicebox: typ wag samego BaseLM (`voxcpm2.base_lm_weight_type`);
++  // puste = ten sam co `weight_storage_type`.
++  std::optional<engine::assets::TensorStorageType> base_lm_weight_storage_type;
+ };
+ 
+ class VoxCPM2FeatureGeneratorRuntime final {
+diff --git a/include/engine/models/voxcpm2/minicpm.h b/include/engine/models/voxcpm2/minicpm.h
+index 1b26566..8ad36b2 100644
+--- a/include/engine/models/voxcpm2/minicpm.h
++++ b/include/engine/models/voxcpm2/minicpm.h
+@@ -98,6 +98,18 @@ struct VoxCPM2PromptPrefillInput {
+   std::vector<float> text_mask;
+   std::vector<float> audio_mask;
+   int64_t steps = 0;
++  // Voicebox: KV zostaje na karcie (bez odczytu do `base_state`/`residual_state`);
++  // wołający przenosi je przez `backend_state()` + `import_state_from_backend`.
++  bool keep_state_on_backend = false;
++};
++
++// Voicebox: tensory KV z ostatniego prefillu, ważne do następnego `run`/zwolnienia.
++struct VoxCPM2PromptPrefillBackendState {
++  std::vector<ggml_tensor *> base_keys;
++  std::vector<ggml_tensor *> base_values;
++  std::vector<ggml_tensor *> residual_keys;
++  std::vector<ggml_tensor *> residual_values;
++  int64_t steps = 0;
+ };
+ 
+ struct VoxCPM2PromptPrefillOutput {
+@@ -112,7 +124,8 @@ public:
+   VoxCPM2WeightsRuntime(std::shared_ptr<const VoxCPM2Assets> assets,
+                         engine::core::ExecutionContext &execution_context,
+                         size_t weight_context_bytes,
+-                        engine::assets::TensorStorageType weight_storage_type);
++                        engine::assets::TensorStorageType weight_storage_type,
++                        engine::assets::TensorStorageType base_lm_weight_storage_type);
+   ~VoxCPM2WeightsRuntime();
+ 
+   const VoxCPM2Assets &assets() const noexcept;
+@@ -135,6 +148,9 @@ public:
+   ~VoxCPM2TextEmbeddingRuntime();
+ 
+   std::vector<float> embed_token(int32_t token_id);
++  // Voicebox: wszystkie tokeny jednym grafem (wynik [n × hidden] po kolei)
++  // zamiast compute+sync+odczytu na każdy token osobno.
++  std::vector<float> embed_tokens(const std::vector<int32_t> &token_ids);
+ 
+ private:
+   class Impl;
+@@ -149,6 +165,7 @@ public:
+   ~VoxCPM2PromptPrefillRuntime();
+ 
+   VoxCPM2PromptPrefillOutput run(const VoxCPM2PromptPrefillInput &input);
++  VoxCPM2PromptPrefillBackendState backend_state() const;
+   void release_runtime_memory();
+ 
+ private:
+@@ -166,6 +183,9 @@ public:
+ 
+   void reset();
+   void import_state(const engine::runtime::TransformerKVState &state);
++  void import_state_from_backend(const std::vector<ggml_tensor *> &keys,
++                                 const std::vector<ggml_tensor *> &values,
++                                 int64_t steps);
+   engine::runtime::TransformerKVState export_state() const;
+   VoxCPM2MiniCPMStepOutput run_step(const std::vector<float> &embedding);
+   void release_runtime_memory();
+diff --git a/src/framework/assets/tensor_source.cpp b/src/framework/assets/tensor_source.cpp
+index f5d0da2..391322f 100644
+--- a/src/framework/assets/tensor_source.cpp
++++ b/src/framework/assets/tensor_source.cpp
+@@ -5,6 +5,7 @@
+ #include "engine/framework/io/json.h"
+ #include "engine/framework/io/safetensors.h"
+ 
++#include <ggml-backend.h>
+ #include <gguf.h>
+ 
+ #include <algorithm>
+@@ -239,6 +240,25 @@ std::vector<std::byte> quantize_f32_rows(
+     return bytes;
+ }
+ 
++// Voicebox: wrzut wag na karte przez PRZYPIETY bufor hosta. Prosto z mmapu
++// pliku HIP kopiuje stronicowalna pamiec malymi, synchronicznymi kawalkami
++// (perf 10.10: 69% `BusyWaitSignal`; gotowy F16 GGUF ladowal sie 15 s zamiast 7,
++// bo jego tensory szly wprost z mapy). Tu: memcpy do przypietego bufora i DMA
++// z niego. Bufor zyje do konca ladowania (`release_upload_staging`).
++constexpr size_t kUploadStagingBytes = size_t{64} << 20;
++std::mutex g_upload_staging_mutex;
++ggml_backend_buffer_t g_upload_staging = nullptr;
++ggml_backend_buffer_type_t g_upload_staging_type = nullptr;
++
++ggml_backend_buffer_type_t pinned_host_buffer_type_for(const ggml_tensor * tensor) {
++    const ggml_backend_buffer_t buffer = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
++    if (buffer == nullptr || ggml_backend_buffer_is_host(buffer)) {
++        return nullptr;
++    }
++    const ggml_backend_dev_t device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
++    return device != nullptr ? ggml_backend_dev_host_buffer_type(device) : nullptr;
++}
++
+ void set_tensor_bytes(ggml_tensor * tensor, const void * data, size_t bytes, std::string_view name) {
+     if (tensor == nullptr) {
+         throw std::runtime_error("cannot upload to a null backend tensor: " + std::string(name));
+@@ -246,6 +266,26 @@ void set_tensor_bytes(ggml_tensor * tensor, const void * data, size_t bytes, std
+     if (bytes != ggml_nbytes(tensor)) {
+         throw std::runtime_error("backend tensor byte size mismatch for " + std::string(name));
+     }
++    if (ggml_backend_buffer_type_t host_type = pinned_host_buffer_type_for(tensor)) {
++        std::lock_guard<std::mutex> lock(g_upload_staging_mutex);
++        if (g_upload_staging == nullptr || g_upload_staging_type != host_type) {
++            if (g_upload_staging != nullptr) {
++                ggml_backend_buffer_free(g_upload_staging);
++            }
++            g_upload_staging = ggml_backend_buft_alloc_buffer(host_type, kUploadStagingBytes);
++            g_upload_staging_type = g_upload_staging != nullptr ? host_type : nullptr;
++        }
++        if (g_upload_staging != nullptr) {
++            auto * staging = static_cast<std::byte *>(ggml_backend_buffer_get_base(g_upload_staging));
++            const auto * source = static_cast<const std::byte *>(data);
++            for (size_t offset = 0; offset < bytes; offset += kUploadStagingBytes) {
++                const size_t count = std::min(kUploadStagingBytes, bytes - offset);
++                std::memcpy(staging, source + offset, count);
++                ggml_backend_tensor_set(tensor, staging, offset, count);
++            }
++            return;
++        }
++    }
+     ggml_backend_tensor_set(tensor, data, 0, bytes);
+ }
+ 
+@@ -1423,6 +1463,15 @@ std::string TensorSource::require_tensor_name(
+     throw std::runtime_error("none of the candidate tensor names were found");
+ }
+ 
++void release_upload_staging() {
++    std::lock_guard<std::mutex> lock(g_upload_staging_mutex);
++    if (g_upload_staging != nullptr) {
++        ggml_backend_buffer_free(g_upload_staging);
++        g_upload_staging = nullptr;
++        g_upload_staging_type = nullptr;
++    }
++}
++
+ TensorStorageType parse_tensor_storage_type(std::string_view value) {
+     const std::string normalized = lower_ascii(value);
+     if (normalized == "native" || normalized == "source" || normalized == "auto" || normalized == "orig" ||
+diff --git a/src/framework/runtime/kv_cache.cpp b/src/framework/runtime/kv_cache.cpp
+index 4ab7210..0b7f982 100644
+--- a/src/framework/runtime/kv_cache.cpp
++++ b/src/framework/runtime/kv_cache.cpp
+@@ -3,7 +3,12 @@
+ #include "engine/framework/core/backend.h"
+ #include "engine/framework/debug/trace.h"
+ 
++#include <ggml-alloc.h>
++#include <ggml-backend.h>
++#include <ggml.h>
++
+ #include <algorithm>
++#include <memory>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -47,6 +52,30 @@ void write_cache_tensor(
+     throw std::runtime_error("TransformerKVCache requires f32 cache tensors");
+ }
+ 
++// Zapis tylko pierwszych `count` elementów (konwersja tylko tej części).
++void write_cache_prefix(const core::TensorValue & tensor, const std::vector<float> & values, size_t count) {
++    if (count == 0) {
++        return;
++    }
++    if (tensor.type == GGML_TYPE_F32) {
++        ggml_backend_tensor_set(tensor.tensor, values.data(), 0, count * sizeof(float));
++        return;
++    }
++    if (tensor.type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> half(count);
++        ggml_fp32_to_fp16_row(values.data(), half.data(), static_cast<int64_t>(count));
++        ggml_backend_tensor_set(tensor.tensor, half.data(), 0, count * sizeof(ggml_fp16_t));
++        return;
++    }
++    if (tensor.type == GGML_TYPE_BF16) {
++        std::vector<ggml_bf16_t> bf(count);
++        ggml_fp32_to_bf16_row(values.data(), bf.data(), static_cast<int64_t>(count));
++        ggml_backend_tensor_set(tensor.tensor, bf.data(), 0, count * sizeof(ggml_bf16_t));
++        return;
++    }
++    throw std::runtime_error("TransformerKVCache prefix write: unsupported cache type");
++}
++
+ void copy_cache_row(
+     const std::vector<float> & source,
+     int64_t source_row,
+@@ -123,6 +152,78 @@ TransformerKVCache::TransformerKVCache(
+     }
+ }
+ 
++void TransformerKVCache::import_prefix_from_backend(
++    ggml_backend_t backend,
++    const std::vector<ggml_tensor *> & keys,
++    const std::vector<ggml_tensor *> & values,
++    int64_t steps) {
++    if (keys.size() != layers_.size() || values.size() != layers_.size()) {
++        throw std::runtime_error("TransformerKVCache backend import: layer count does not match");
++    }
++    if (steps < 0 || steps > cache_steps_) {
++        throw std::runtime_error("TransformerKVCache backend import: steps exceed cache capacity");
++    }
++    if (options_.ring_mode) {
++        throw std::runtime_error("TransformerKVCache backend import: ring mode is not supported");
++    }
++    const int64_t count = steps * step_elems_;
++    if (count > 0 && !layers_.empty()) {
++        // Jeden graf: cpy(widok źródła → widok prefiksu cache) na warstwę, K i V.
++        // ggml_cpy konwertuje typ (F32 z prefillu → F16 cache) na karcie.
++        const size_t nodes = layers_.size() * 2 * 3 + 16;
++        ggml_init_params params{
++            ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false),
++            nullptr, true};
++        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
++        if (ctx == nullptr) {
++            throw std::runtime_error("TransformerKVCache backend import: context init failed");
++        }
++        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), nodes, false);
++        for (size_t layer = 0; layer < layers_.size(); ++layer) {
++            for (int kv = 0; kv < 2; ++kv) {
++                ggml_tensor * src = kv == 0 ? keys[layer] : values[layer];
++                ggml_tensor * dst = kv == 0 ? layers_[layer].key_tensor.tensor
++                                            : layers_[layer].value_tensor.tensor;
++                if (src == nullptr || src->data == nullptr || src->buffer == nullptr ||
++                    !ggml_is_contiguous(src) || ggml_nelements(src) < count) {
++                    throw std::runtime_error("TransformerKVCache backend import: source tensor is invalid");
++                }
++                // ⚠️ Aliasy (sam bufor), NIE ggml_view: źródło jest wynikiem
++                // operacji z grafu prefillu i widok wciągnąłby do tego grafu
++                // całą jego historię (GGML_ASSERT n_nodes < size).
++                auto alias = [&](ggml_tensor * of) {
++                    ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), of->type, count);
++                    t->data = of->data;
++                    t->buffer = of->buffer;
++                    return t;
++                };
++                ggml_build_forward_expand(graph, ggml_cpy(ctx.get(), alias(src), alias(dst)));
++            }
++        }
++        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
++        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc, graph) ||
++            core::compute_backend_graph(backend, graph) != GGML_STATUS_SUCCESS) {
++            if (galloc != nullptr) {
++                ggml_gallocr_free(galloc);
++            }
++            throw std::runtime_error("TransformerKVCache backend import: copy graph failed");
++        }
++        ggml_backend_synchronize(backend);
++        ggml_gallocr_free(galloc);
++    }
++    for (auto & layer : layers_) {
++        for (const auto * value : {&layer.key_tensor, &layer.value_tensor}) {
++            const size_t done = static_cast<size_t>(count) * ggml_element_size(value->tensor);
++            const size_t total = ggml_nbytes(value->tensor);
++            if (done < total) {
++                ggml_backend_tensor_memset(value->tensor, 0, done, total - done);
++            }
++        }
++    }
++    valid_steps_ = steps;
++    current_end_ = steps;
++}
++
+ void TransformerKVCache::clear_on_backend() {
+     for (auto & layer : layers_) {
+         ggml_backend_tensor_memset(layer.key_tensor.tensor, 0, 0, ggml_nbytes(layer.key_tensor.tensor));
+@@ -159,6 +260,20 @@ void TransformerKVCache::import_state(const TransformerKVState & state) {
+         if (source.key.size() != keep_elems) {
+             throw std::runtime_error("TransformerKVCache source tensors do not match valid_steps * step_elems");
+         }
++        if (cache_steps_ > 0 && !options_.ring_mode) {
++            // Ważne wiersze konwertujemy na CPU, resztę zerujemy NA KARCIE —
++            // zamiast zerować, konwertować i wgrywać cały cache przy każdym żądaniu.
++            for (const auto * pair : {&cache.key_tensor, &cache.value_tensor}) {
++                const auto & src = pair == &cache.key_tensor ? source.key : source.value;
++                write_cache_prefix(*pair, src, keep_elems);
++                const size_t done = keep_elems * ggml_element_size(pair->tensor);
++                const size_t total = ggml_nbytes(pair->tensor);
++                if (done < total) {
++                    ggml_backend_tensor_memset(pair->tensor, 0, done, total - done);
++                }
++            }
++            continue;
++        }
+         if (cache_steps_ > 0) {
+             const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
+             cache.import_key_scratch.resize(cache_elems);
+diff --git a/src/models/voxcpm2/audiovae.cpp b/src/models/voxcpm2/audiovae.cpp
+index 2d890f5..93aacc6 100644
+--- a/src/models/voxcpm2/audiovae.cpp
++++ b/src/models/voxcpm2/audiovae.cpp
+@@ -84,6 +84,9 @@ struct VAEDecoderBlockWeights {
+   VAESampleRateConditionWeights sr_cond;
+   VAESnakeWeights snake;
+   VAEConvTranspose1dWeights upsample;
++  // Wagi upsample przepisane RAZ do układu mnożenia [in, kernel*out] F32 —
++  // framework robił cont(permute) przy każdym przebiegu (128 MB na kawałek).
++  ggml_tensor *upsample_perm = nullptr;
+   std::vector<VAEResidualUnitWeights> residual_units;
+   int64_t input_channels = 0;
+   int64_t output_channels = 0;
+@@ -408,14 +411,42 @@ core::TensorValue zeros_like_prefix(core::ModuleBuildContext &ctx,
+                            prefix.shape, GGML_TYPE_F32);
+ }
+ 
++// Stan strumienia: jeden slot [frames, C, 1] na każde miejsce przyczynowe.
++// Zerowe sloty = pierwszy kawałek jak świeża konwolucja przyczynowa.
++struct StreamSlots {
++  ggml_context *ctx = nullptr;
++  std::vector<ggml_tensor *> slots;
++  std::vector<ggml_tensor *> updates;
++};
++
+ core::TensorValue causal_pad_left(core::ModuleBuildContext &ctx,
+                                   const core::TensorValue &input,
+-                                  int64_t frames) {
++                                  int64_t frames,
++                                  StreamSlots *stream = nullptr) {
+   if (frames <= 0) {
+     return input;
+   }
+-  return modules::ConcatModule({2}).build(
+-      ctx, zeros_like_prefix(ctx, input, frames), input);
++  if (stream == nullptr) {
++    return modules::ConcatModule({2}).build(
++        ctx, zeros_like_prefix(ctx, input, frames), input);
++  }
++  const auto in = core::ensure_backend_addressable_layout(ctx, input);
++  ggml_tensor *slot = ggml_new_tensor_3d(stream->ctx, GGML_TYPE_F32, frames,
++                                         in.tensor->ne[1], in.tensor->ne[2]);
++  stream->slots.push_back(slot);
++  ggml_tensor *padded = ggml_concat(ctx.ggml, slot, in.tensor, 0);
++  // Ogon tego kawałka = lewy kontekst następnego (z padded, żeby kawałek
++  // krótszy niż `frames` też poprawnie sklejał stary slot z nowymi ramkami).
++  ggml_tensor *tail = ggml_view_3d(
++      ctx.ggml, padded, frames, padded->ne[1], padded->ne[2], padded->nb[1],
++      padded->nb[2], static_cast<size_t>(padded->ne[0] - frames) * padded->nb[0]);
++  stream->updates.push_back(
++      ggml_cpy(ctx.ggml, ggml_cont(ctx.ggml, tail), slot));
++  return core::wrap_tensor(
++      padded,
++      core::TensorShape::from_dims(
++          {input.shape.dims[0], input.shape.dims[1], input.shape.dims[2] + frames}),
++      GGML_TYPE_F32);
+ }
+ 
+ core::TensorValue snake_exact(core::ModuleBuildContext &ctx,
+@@ -468,13 +499,14 @@ core::TensorValue causal_conv1d(core::ModuleBuildContext &ctx,
+                                 const core::TensorValue &input,
+                                 const VAEConv1dWeights &weights, int stride,
+                                 int padding, int dilation,
+-                                int output_padding = 0) {
++                                int output_padding = 0,
++                                StreamSlots *stream = nullptr) {
+   const int left_pad = 2 * padding - output_padding;
+   if (left_pad < 0) {
+     throw std::runtime_error(
+         "VoxCPM2 AudioVAE causal convolution padding is invalid");
+   }
+-  auto padded = causal_pad_left(ctx, input, left_pad);
++  auto padded = causal_pad_left(ctx, input, left_pad, stream);
+   if (weights.depthwise_layout) {
+     return modules::DepthwiseConv1dModule(
+                {weights.out_channels, weights.kernel_size, stride, 0, dilation,
+@@ -490,15 +522,43 @@ core::TensorValue causal_conv1d(core::ModuleBuildContext &ctx,
+ core::TensorValue
+ causal_conv_transpose1d(core::ModuleBuildContext &ctx,
+                         const core::TensorValue &input,
+-                        const VAEConvTranspose1dWeights &weights, int stride) {
+-  auto full =
+-      modules::ConvTranspose1dModule({weights.in_channels, weights.out_channels,
+-                                      weights.kernel_size, stride, 0, 1,
+-                                      weights.conv.bias.has_value()})
+-          .build(ctx, input, weights.conv);
++                        const VAEConvTranspose1dWeights &weights, int stride,
++                        StreamSlots *stream = nullptr,
++                        ggml_tensor *weight_perm = nullptr) {
++  // Przy kernelu 2*stride każda próbka wyjścia widzi najwyżej jedną wcześniejszą
++  // ramkę wejścia; w strumieniu dokładamy ją ze slotu i odcinamy jej wyjście.
++  const int64_t lead =
++      stream != nullptr ? (weights.kernel_size - 1) / stride : 0;
++  const auto x = causal_pad_left(ctx, input, lead, stream);
++  core::TensorValue full;
++  if (weight_perm != nullptr) {
++    // Ta sama ścieżka col2im co we frameworku, tylko z gotowymi wagami.
++    const auto xin = core::ensure_backend_addressable_layout(ctx, x);
++    ggml_tensor *m = ggml_view_2d(ctx.ggml, xin.tensor, xin.tensor->ne[0],
++                                  xin.tensor->ne[1], xin.tensor->nb[1], 0);
++    ggml_tensor *cols = ggml_mul_mat(
++        ctx.ggml, weight_perm, ggml_cont(ctx.ggml, ggml_transpose(ctx.ggml, m)));
++    ggml_tensor *out = ggml_col2im_1d(ctx.ggml, cols, stride,
++                                      static_cast<int>(weights.out_channels), 0);
++    if (weights.conv.bias.has_value()) {
++      out = ggml_add(ctx.ggml, out,
++                     ggml_reshape_2d(ctx.ggml, weights.conv.bias->tensor, 1,
++                                     weights.out_channels));
++    }
++    full = core::wrap_tensor(
++        ggml_reshape_3d(ctx.ggml, out, out->ne[0], out->ne[1], 1),
++        core::TensorShape::from_dims({1, weights.out_channels, out->ne[0]}),
++        GGML_TYPE_F32);
++  } else {
++    full = modules::ConvTranspose1dModule(
++               {weights.in_channels, weights.out_channels, weights.kernel_size,
++                stride, 0, 1, weights.conv.bias.has_value()})
++               .build(ctx, x, weights.conv);
++  }
+   const int64_t frames = input.shape.dims[2] * stride;
+   auto view = ggml_view_3d(ctx.ggml, full.tensor, frames, weights.out_channels,
+-                           1, full.tensor->nb[1], full.tensor->nb[2], 0);
++                           1, full.tensor->nb[1], full.tensor->nb[2],
++                           static_cast<size_t>(lead * stride) * full.tensor->nb[0]);
+   return core::wrap_tensor(
+       ggml_cont(ctx.ggml, view),
+       core::TensorShape::from_dims({1, weights.out_channels, frames}),
+@@ -508,12 +568,13 @@ causal_conv_transpose1d(core::ModuleBuildContext &ctx,
+ core::TensorValue residual_unit(core::ModuleBuildContext &ctx,
+                                 const core::TensorValue &input,
+                                 const VAEResidualUnitWeights &weights,
+-                                int dilation) {
++                                int dilation, StreamSlots *stream = nullptr) {
+   const int padding = static_cast<int>(((kResidualKernel - 1) * dilation) / 2);
+   auto hidden = snake_exact(ctx, input, weights.snake1, input.shape.dims[1]);
+-  hidden = causal_conv1d(ctx, hidden, weights.conv1, 1, padding, dilation);
++  hidden = causal_conv1d(ctx, hidden, weights.conv1, 1, padding, dilation, 0,
++                         stream);
+   hidden = snake_exact(ctx, hidden, weights.snake2, input.shape.dims[1]);
+-  hidden = causal_conv1d(ctx, hidden, weights.conv2, 1, 0, 1);
++  hidden = causal_conv1d(ctx, hidden, weights.conv2, 1, 0, 1, 0, stream);
+   return modules::AddModule{}.build(ctx, input, hidden);
+ }
+ 
+@@ -532,15 +593,17 @@ core::TensorValue encoder_block(core::ModuleBuildContext &ctx,
+ 
+ core::TensorValue decoder_block(core::ModuleBuildContext &ctx,
+                                 const core::TensorValue &input,
+-                                const VAEDecoderBlockWeights &weights) {
++                                const VAEDecoderBlockWeights &weights,
++                                StreamSlots *stream = nullptr) {
+   auto hidden =
+       apply_sr_condition(ctx, input, weights.sr_cond, weights.input_channels);
+   hidden = snake_exact(ctx, hidden, weights.snake, weights.input_channels);
+-  hidden =
+-      causal_conv_transpose1d(ctx, hidden, weights.upsample, weights.stride);
+-  hidden = residual_unit(ctx, hidden, weights.residual_units[0], 1);
+-  hidden = residual_unit(ctx, hidden, weights.residual_units[1], 3);
+-  hidden = residual_unit(ctx, hidden, weights.residual_units[2], 9);
++  hidden = causal_conv_transpose1d(ctx, hidden, weights.upsample,
++                                   weights.stride, stream,
++                                   weights.upsample_perm);
++  hidden = residual_unit(ctx, hidden, weights.residual_units[0], 1, stream);
++  hidden = residual_unit(ctx, hidden, weights.residual_units[1], 3, stream);
++  hidden = residual_unit(ctx, hidden, weights.residual_units[2], 9, stream);
+   return hidden;
+ }
+ 
+@@ -564,11 +627,102 @@ public:
+       throw std::runtime_error(
+           "VoxCPM2 AudioVAE encoder sample capacity must be positive");
+     }
++    if (core::uses_ggml_cuda_or_hip_backend(execution_context_.backend_type())) {
++      prepare_upsample_weights();
++    }
++  }
++
++  // Jeden graf: cpy(permute(w) -> F32 [in, kernel*out]) dla każdego bloku.
++  void prepare_upsample_weights() {
++    auto &blocks = weights_.decoder_blocks;
++    ggml_init_params pp{ggml_tensor_overhead() * (blocks.size() + 8), nullptr, true};
++    perm_ctx_.reset(ggml_init(pp));
++    ggml_init_params tp{ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
++                        nullptr, true};
++    std::unique_ptr<ggml_context, GgmlContextDeleter> tmp(ggml_init(tp));
++    if (perm_ctx_ == nullptr || tmp == nullptr) {
++      throw std::runtime_error("VoxCPM2 AudioVAE: perm context init failed");
++    }
++    ggml_cgraph *g = ggml_new_graph(tmp.get());
++    for (auto &b : blocks) {
++      const auto &u = b.upsample;
++      // F16 zostaje F16 (mul_mat F16×F32 jest natywny); reszta → F32.
++      const ggml_type perm_type = u.conv.weight.tensor->type == GGML_TYPE_F16
++                                      ? GGML_TYPE_F16
++                                      : GGML_TYPE_F32;
++      b.upsample_perm = ggml_new_tensor_2d(perm_ctx_.get(), perm_type,
++                                           u.in_channels,
++                                           u.kernel_size * u.out_channels);
++      ggml_tensor *src = ggml_permute(tmp.get(), u.conv.weight.tensor, 1, 2, 0, 3);
++      ggml_build_forward_expand(
++          g, ggml_cpy(tmp.get(), src,
++                      ggml_reshape_3d(tmp.get(), b.upsample_perm, u.in_channels,
++                                      u.kernel_size, u.out_channels)));
++    }
++    perm_buf_ = ggml_backend_alloc_ctx_tensors(perm_ctx_.get(),
++                                               execution_context_.backend());
++    ggml_gallocr_t ga = ggml_gallocr_new(
++        ggml_backend_get_default_buffer_type(execution_context_.backend()));
++    if (perm_buf_ == nullptr || ga == nullptr ||
++        !ggml_gallocr_alloc_graph(ga, g) ||
++        core::compute_backend_graph(execution_context_.backend(), g) !=
++            GGML_STATUS_SUCCESS) {
++      if (ga != nullptr) ggml_gallocr_free(ga);
++      throw std::runtime_error("VoxCPM2 AudioVAE: upsample weight prep failed");
++    }
++    ggml_backend_synchronize(execution_context_.backend());
++    ggml_gallocr_free(ga);
+   }
+ 
+   ~Impl() {
++    release_stream_graph();
+     release_decoder_graph();
+     release_encoder_graph();
++    if (perm_buf_ != nullptr) {
++      ggml_backend_buffer_free(perm_buf_);
++    }
++  }
++
++  void stream_begin() {
++    if (stream_graph_ == nullptr) {
++      build_stream_decoder();
++    }
++    ggml_backend_buffer_clear(stream_buf_, 0);
++  }
++
++  runtime::AudioBuffer decode_stream_patch(const std::vector<float> &features) {
++    const auto &vae = assets_->config.audio_vae;
++    if (stream_graph_ == nullptr) {
++      throw std::runtime_error("VoxCPM2 AudioVAE stream_begin() not called");
++    }
++    const int64_t frames = assets_->config.patch_size;
++    if (static_cast<int64_t>(features.size()) != frames * vae.latent_dim) {
++      throw std::runtime_error("VoxCPM2 AudioVAE stream patch size mismatch");
++    }
++    std::vector<float> input(static_cast<size_t>(vae.latent_dim * frames));
++    for (int64_t t = 0; t < frames; ++t) {
++      for (int64_t c = 0; c < vae.latent_dim; ++c) {
++        input[static_cast<size_t>(c * frames + t)] =
++            features[static_cast<size_t>(t * vae.latent_dim + c)];
++      }
++    }
++    ggml_backend_tensor_set(stream_input_, input.data(), 0,
++                            input.size() * sizeof(float));
++    core::set_backend_threads(execution_context_.backend(),
++                              std::max(1, execution_context_.config().threads));
++    const ggml_status status = core::compute_backend_graph(
++        execution_context_.backend(), stream_graph_);
++    ggml_backend_synchronize(execution_context_.backend());
++    if (status != GGML_STATUS_SUCCESS) {
++      throw std::runtime_error("VoxCPM2 AudioVAE stream graph compute failed");
++    }
++    runtime::AudioBuffer audio;
++    audio.sample_rate = vae.output_sample_rate;
++    audio.channels = 1;
++    audio.samples.resize(static_cast<size_t>(frames * product(vae.decoder_rates)));
++    ggml_backend_tensor_get(stream_output_, audio.samples.data(), 0,
++                            audio.samples.size() * sizeof(float));
++    return audio;
+   }
+ 
+   runtime::AudioBuffer decode_features(const std::vector<float> &features,
+@@ -638,6 +792,7 @@ public:
+   }
+ 
+   void release_runtime_memory() {
++    release_stream_graph();
+     release_decoder_graph();
+     release_encoder_graph();
+   }
+@@ -832,6 +987,83 @@ private:
+     decoder_latent_frame_capacity_ = latent_frame_capacity;
+   }
+ 
++  void release_stream_graph() {
++    if (stream_graph_ != nullptr) {
++      core::release_backend_graph_resources(execution_context_.backend(),
++                                            stream_graph_);
++    }
++    if (stream_gallocr_ != nullptr) {
++      ggml_gallocr_free(stream_gallocr_);
++      stream_gallocr_ = nullptr;
++    }
++    if (stream_buf_ != nullptr) {
++      ggml_backend_buffer_free(stream_buf_);
++      stream_buf_ = nullptr;
++    }
++    stream_graph_ = nullptr;
++    stream_input_ = nullptr;
++    stream_output_ = nullptr;
++    stream_ctx_.reset();
++    stream_state_ctx_.reset();
++  }
++
++  // Graf na dokładnie jeden kawałek (patch_size ramek, bez zer na końcu —
++  // inaczej zera wpadłyby do stanu). Zapisy slotów idą PO głównym łańcuchu:
++  // każdy slot jest czytany przez concat na początku i nadpisywany na końcu.
++  void build_stream_decoder() {
++    const auto &vae = assets_->config.audio_vae;
++    release_stream_graph();
++    const int64_t frames = assets_->config.patch_size;
++    ggml_init_params state_params{ggml_tensor_overhead() * 256, nullptr, true};
++    stream_state_ctx_.reset(ggml_init(state_params));
++    ggml_init_params params{config_.graph_context_bytes, nullptr, true};
++    stream_ctx_.reset(ggml_init(params));
++    if (stream_ctx_ == nullptr || stream_state_ctx_ == nullptr) {
++      throw std::runtime_error(
++          "failed to initialize VoxCPM2 AudioVAE stream graph context");
++    }
++    StreamSlots stream;
++    stream.ctx = stream_state_ctx_.get();
++    core::ModuleBuildContext ctx{stream_ctx_.get(), "voxcpm2.audiovae.stream",
++                                 execution_context_.backend_type()};
++    auto hidden = core::make_tensor(
++        ctx, GGML_TYPE_F32,
++        core::TensorShape::from_dims({1, vae.latent_dim, frames}));
++    stream_input_ = hidden.tensor;
++    ggml_set_input(stream_input_);
++    hidden = causal_conv1d(ctx, hidden, weights_.decoder_first_depthwise, 1, 3,
++                           1, 0, &stream);
++    hidden = causal_conv1d(ctx, hidden, weights_.decoder_first_pointwise, 1, 0,
++                           1, 0, &stream);
++    for (const auto &block : weights_.decoder_blocks) {
++      hidden = decoder_block(ctx, hidden, block, &stream);
++    }
++    hidden = snake_exact(ctx, hidden, weights_.decoder_final_snake,
++                         hidden.shape.dims[1]);
++    hidden = causal_conv1d(ctx, hidden, weights_.decoder_final_conv, 1, 3, 1, 0,
++                           &stream);
++    hidden = modules::TanhModule{}.build(ctx, hidden);
++    stream_output_ = hidden.tensor;
++    ggml_set_output(stream_output_);
++    stream_graph_ = ggml_new_graph_custom(stream_ctx_.get(), 65536, false);
++    ggml_build_forward_expand(stream_graph_, stream_output_);
++    for (ggml_tensor *update : stream.updates) {
++      ggml_build_forward_expand(stream_graph_, update);
++    }
++    stream_buf_ = ggml_backend_alloc_ctx_tensors(stream_state_ctx_.get(),
++                                                 execution_context_.backend());
++    stream_gallocr_ = ggml_gallocr_new(
++        ggml_backend_get_default_buffer_type(execution_context_.backend()));
++    if (stream_buf_ == nullptr || stream_gallocr_ == nullptr ||
++        !ggml_gallocr_reserve(stream_gallocr_, stream_graph_) ||
++        !ggml_gallocr_alloc_graph(stream_gallocr_, stream_graph_)) {
++      release_stream_graph();
++      throw std::runtime_error("failed to allocate VoxCPM2 AudioVAE stream graph");
++    }
++    engine::debug::timing_log_scalar("voxcpm2.audiovae.stream.slots",
++                                     static_cast<int64_t>(stream.slots.size()));
++  }
++
+   void release_encoder_graph() {
+     if (encoder_graph_ != nullptr) {
+       core::release_backend_graph_resources(execution_context_.backend(),
+@@ -898,6 +1130,15 @@ private:
+   VAEWeights weights_;
+   std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+   std::unique_ptr<ggml_context, GgmlContextDeleter> encoder_ctx_;
++  std::unique_ptr<ggml_context, GgmlContextDeleter> stream_ctx_;
++  std::unique_ptr<ggml_context, GgmlContextDeleter> perm_ctx_;
++  ggml_backend_buffer_t perm_buf_ = nullptr;
++  std::unique_ptr<ggml_context, GgmlContextDeleter> stream_state_ctx_;
++  ggml_tensor *stream_input_ = nullptr;
++  ggml_tensor *stream_output_ = nullptr;
++  ggml_cgraph *stream_graph_ = nullptr;
++  ggml_gallocr_t stream_gallocr_ = nullptr;
++  ggml_backend_buffer_t stream_buf_ = nullptr;
+   ggml_tensor *input_ = nullptr;
+   ggml_tensor *output_ = nullptr;
+   ggml_tensor *encoder_input_ = nullptr;
+@@ -937,4 +1178,11 @@ void VoxCPM2AudioVAEDecoderRuntime::release_runtime_memory() {
+   impl_->release_runtime_memory();
+ }
+ 
++void VoxCPM2AudioVAEDecoderRuntime::stream_begin() { impl_->stream_begin(); }
++
++runtime::AudioBuffer VoxCPM2AudioVAEDecoderRuntime::decode_stream_patch(
++    const std::vector<float> &features) {
++  return impl_->decode_stream_patch(features);
++}
++
+ } // namespace engine::models::voxcpm2
+diff --git a/src/models/voxcpm2/generator.cpp b/src/models/voxcpm2/generator.cpp
+index 0f77b59..5d43b4e 100644
+--- a/src/models/voxcpm2/generator.cpp
++++ b/src/models/voxcpm2/generator.cpp
+@@ -1,6 +1,9 @@
+ #include "engine/models/voxcpm2/generator.h"
+ 
+ #include "minicpm_blocks.h"
++#include "prompt_disk_cache.h"
++
++#include <filesystem>
+ 
+ #include "engine/framework/core/execution_context.h"
+ #include "engine/framework/debug/profiler.h"
+@@ -1205,7 +1208,8 @@ public:
+       : assets_(require_assets(std::move(assets))),
+         weights_(std::make_shared<VoxCPM2WeightsRuntime>(
+             assets_, execution_context, config.weight_context_bytes,
+-            config.weight_storage_type)),
++            config.weight_storage_type,
++            config.base_lm_weight_storage_type.value_or(config.weight_storage_type))),
+         tokenizer_(assets_),
+         text_embedding_(weights_, config.text_embedding_graph_context_bytes,
+                         config.mem_saver),
+@@ -1221,7 +1225,10 @@ public:
+         cfm_(weights_, config.dit_graph_context_bytes, config.mem_saver),
+         local_encoder_(weights_, config.local_encoder_graph_context_bytes,
+                        config.mem_saver),
+-        prompt_audio_embedding_cache_(config.prompt_cache_slots) {}
++        prompt_audio_embedding_cache_(config.prompt_cache_slots),
++        disk_cache_dir_(config.prompt_disk_cache_dir),
++        disk_cache_weight_type_(
++            static_cast<int64_t>(config.weight_storage_type)) {}
+ 
+   VoxCPM2Result generate_zero_shot(const std::string &text,
+                                    const VoxCPM2GenerationOptions &options) {
+@@ -1280,8 +1287,8 @@ public:
+ 
+   void release_runtime_memory() {
+     prefill_.release_runtime_memory();
+-    base_lm_.release_runtime_memory();
+-    residual_lm_.release_runtime_memory();
++    // Voicebox (decyzja grruwiego 10.10): grafy BaseLM/ResidualLM i ich KV
++    // (288 MiB F16) ZOSTAJĄ między żądaniami — odbudowa kosztowała ~80 ms TTFT.
+   }
+ 
+ private:
+@@ -1442,10 +1449,38 @@ private:
+ 
+     const auto embedding_start = Clock::now();
+     PromptAudioEmbeddingCacheEntry entry;
+-    entry.prompt_embeddings = encode_feature_embeddings(
+-        prompt.prompt_features, prompt.prompt_patches, patch_elems);
+-    entry.reference_embeddings = encode_feature_embeddings(
+-        prompt.reference_features, prompt.reference_patches, patch_elems);
++    // Voicebox: przed LocEnc pytamy dysk. Embeddingi zależą od cech i typu
++    // wag generatora.
++    std::filesystem::path disk_file;
++    bool disk_hit = false;
++    if (!disk_cache_dir_.empty()) {
++      prompt_disk_cache::Hasher hasher;
++      hasher.str("voxcpm2.prompt_embeddings.v1");
++      hasher.i64(disk_cache_weight_type_);
++      hasher.i64(prompt.prompt_patches);
++      hasher.floats(prompt.prompt_features);
++      hasher.i64(prompt.reference_patches);
++      hasher.floats(prompt.reference_features);
++      disk_file = std::filesystem::path(disk_cache_dir_) / (hasher.hex() + ".emb");
++      if (auto blob = prompt_disk_cache::load(disk_file, 0, 2)) {
++        entry.prompt_embeddings = std::move(blob->arrays[0]);
++        entry.reference_embeddings = std::move(blob->arrays[1]);
++        disk_hit = true;
++      }
++    }
++    if (!disk_hit) {
++      entry.prompt_embeddings = encode_feature_embeddings(
++          prompt.prompt_features, prompt.prompt_patches, patch_elems);
++      entry.reference_embeddings = encode_feature_embeddings(
++          prompt.reference_features, prompt.reference_patches, patch_elems);
++      if (!disk_file.empty()) {
++        prompt_disk_cache::save(
++            disk_file,
++            {{}, {entry.prompt_embeddings, entry.reference_embeddings}});
++      }
++    }
++    debug::trace_log_scalar("voxcpm2.prompt_audio_embedding_cache.disk_hit",
++                            disk_hit ? 1 : 0);
+     const double embedding_ms = engine::debug::elapsed_ms(embedding_start);
+     if (prompt_audio_embedding_cache_.capacity() == 0) {
+       uncached_prompt_audio_embedding_ = std::move(entry);
+@@ -1507,8 +1542,15 @@ private:
+           + std::to_string(max_tokens) + " requested tokens, limit "
+           + std::to_string(config.max_length) + "); shorten the input text");
+     }
++    // Voicebox: rozbicie TTFT — reset, embeddingi tekstu, prefill, pierwszy kawałek.
++    const auto gen_start = std::chrono::steady_clock::now();
++    double t_text_embed = 0.0;
++    int64_t text_rows = 0;
+     base_lm_.reset();
+     residual_lm_.reset();
++    const double t_reset = std::chrono::duration<double, std::milli>(
++                               std::chrono::steady_clock::now() - gen_start)
++                               .count();
+ 
+     std::vector<float> zero_hidden(static_cast<size_t>(hidden_size), 0.0F);
+     std::vector<float> zero_patch(static_cast<size_t>(patch_elems), 0.0F);
+@@ -1521,6 +1563,18 @@ private:
+     prefill_input.text_mask.reserve(static_cast<size_t>(prefill_input.steps));
+     prefill_input.audio_mask.reserve(static_cast<size_t>(prefill_input.steps));
+     std::vector<float> prefix_cond = zero_patch;
++    // Voicebox: embeddingi całego tekstu jednym grafem, potem rozkładane po wierszach.
++    std::vector<int32_t> text_tokens;
++    for (const auto &row : prefill.rows) {
++      if (row.text_mask) {
++        text_tokens.push_back(row.token);
++      }
++    }
++    const auto t_embed0 = std::chrono::steady_clock::now();
++    const auto text_embeddings = text_embedding_.embed_tokens(text_tokens);
++    t_text_embed = std::chrono::duration<double, std::milli>(
++                       std::chrono::steady_clock::now() - t_embed0)
++                       .count();
+     for (const auto &row : prefill.rows) {
+       if (row.text_mask == row.audio_mask) {
+         throw std::runtime_error("VoxCPM2 prefill row mask is invalid");
+@@ -1528,7 +1582,9 @@ private:
+       std::vector<float> input_embedding;
+       std::vector<float> current_embed = zero_hidden;
+       if (row.text_mask) {
+-        input_embedding = text_embedding_.embed_token(row.token);
++        const auto first = text_embeddings.begin() + text_rows * hidden_size;
++        input_embedding.assign(first, first + hidden_size);
++        ++text_rows;
+       } else {
+         current_embed = row.embedding;
+         if (static_cast<int64_t>(current_embed.size()) != hidden_size) {
+@@ -1547,11 +1603,33 @@ private:
+       prefill_input.text_mask.push_back(row.text_mask ? 1.0F : 0.0F);
+       prefill_input.audio_mask.push_back(row.audio_mask ? 1.0F : 0.0F);
+     }
++    // Voicebox: KV z prefillu przechodzi do cache kroków karta→karta
++    // (`import_state_from_backend`), bez odczytu na CPU i ponownego wgrania.
++    prefill_input.keep_state_on_backend = true;
++    const auto t_prefill0 = std::chrono::steady_clock::now();
+     const auto prefill_output = prefill_.run(prefill_input);
+-    base_lm_.import_state(prefill_output.base_state);
+-    residual_lm_.import_state(prefill_output.residual_state);
++    const double t_prefill_run = std::chrono::duration<double, std::milli>(
++                                     std::chrono::steady_clock::now() - t_prefill0)
++                                     .count();
++    const auto t_import0 = std::chrono::steady_clock::now();
++    const auto prefill_kv = prefill_.backend_state();
++    base_lm_.import_state_from_backend(prefill_kv.base_keys,
++                                       prefill_kv.base_values, prefill_kv.steps);
++    residual_lm_.import_state_from_backend(prefill_kv.residual_keys,
++                                           prefill_kv.residual_values,
++                                           prefill_kv.steps);
++    const double t_import = std::chrono::duration<double, std::milli>(
++                                std::chrono::steady_clock::now() - t_import0)
++                                .count();
+     std::vector<float> lm_hidden = prefill_output.lm_hidden;
+     std::vector<float> residual_hidden = prefill_output.residual_hidden;
++    engine::debug::timing_log_scalar("voxcpm2.prefill.rows", prefill_input.steps);
++    engine::debug::timing_log_scalar("voxcpm2.prefill.text_rows", text_rows);
++    engine::debug::timing_log_scalar("voxcpm2.prefill.reset_ms", t_reset);
++    engine::debug::timing_log_scalar("voxcpm2.prefill.text_embed_ms", t_text_embed);
++    engine::debug::timing_log_scalar("voxcpm2.prefill.run_ms", t_prefill_run);
++    engine::debug::timing_log_scalar("voxcpm2.prefill.import_state_ms", t_import);
++    bool first_chunk_logged = false;
+ 
+     VoxCPM2Result result;
+     std::vector<const PrefillRow *> context_rows;
+@@ -1581,14 +1659,42 @@ private:
+     const bool streaming =
+         streaming_chunks != nullptr || static_cast<bool>(streaming_chunk_callback);
+     const int64_t left_ctx = std::max<int64_t>(0, options.stream_left_context);
++    // Liczniki per etap (ms łącznie); każde wywołanie i tak czeka na wynik.
++    double t_proj = 0.0, t_dit = 0.0, t_locenc = 0.0, t_base = 0.0,
++           t_res = 0.0;
++    int64_t steps_done = 0;
++    auto tick = [](auto start) {
++      return std::chrono::duration<double, std::milli>(
++                 std::chrono::steady_clock::now() - start)
++          .count();
++    };
++    struct StepLog {
++      double *proj, *dit, *locenc, *base, *res;
++      int64_t *steps;
++      ~StepLog() {
++        if (*steps <= 0) return;
++        const double n = static_cast<double>(*steps);
++        engine::debug::timing_log_scalar("voxcpm2.step.count", *steps);
++        engine::debug::timing_log_scalar("voxcpm2.step.dit_ms", *dit / n);
++        engine::debug::timing_log_scalar("voxcpm2.step.projection_ms", *proj / n);
++        engine::debug::timing_log_scalar("voxcpm2.step.local_encoder_ms", *locenc / n);
++        engine::debug::timing_log_scalar("voxcpm2.step.base_lm_ms", *base / n);
++        engine::debug::timing_log_scalar("voxcpm2.step.residual_lm_ms", *res / n);
++      }
++    } step_log{&t_proj, &t_dit, &t_locenc, &t_base, &t_res, &steps_done};
+     for (int64_t index = 0; index < max_tokens; ++index) {
++      ++steps_done;
++      auto t0 = std::chrono::steady_clock::now();
+       const auto projected =
+           projection_.run(lm_hidden, residual_hidden, zero_hidden);
++      t_proj += tick(t0);
+       const auto mu = concat_dit_mu(projected.current_lm_dit_hidden,
+                                     projected.residual_dit_hidden);
++      t0 = std::chrono::steady_clock::now();
+       const auto patch = cfm_.generate_patch(
+           mu, prefix_cond, options.num_inference_steps, options.guidance_scale,
+           options.seed, patch_noise_start, options.cfm_noise_file);
++      t_dit += tick(t0);
+       patch_noise_start += static_cast<uint64_t>(patch_elems);
+       append_patch(result.generated_features, patch, patch_elems);
+       ++result.generated_patches;
+@@ -1606,6 +1712,14 @@ private:
+         chunk.decode_patches = left + 1;
+         chunk.context_patches = left;
+         chunk.generated_patches = result.generated_patches;
++        if (!first_chunk_logged) {
++          first_chunk_logged = true;
++          engine::debug::timing_log_scalar(
++              "voxcpm2.first_chunk_ms",
++              std::chrono::duration<double, std::milli>(
++                  std::chrono::steady_clock::now() - gen_start)
++                  .count());
++        }
+         if (streaming_chunk_callback) {
+           streaming_chunk_callback(chunk);
+         }
+@@ -1620,13 +1734,21 @@ private:
+         break;
+       }
+ 
++      t0 = std::chrono::steady_clock::now();
+       const auto curr_embed = local_encoder_.encode_patch(patch);
++      t_locenc += tick(t0);
++      t0 = std::chrono::steady_clock::now();
+       const auto next_lm = base_lm_.run_step(curr_embed).hidden;
++      t_base += tick(t0);
++      t0 = std::chrono::steady_clock::now();
+       const auto next_projected =
+           projection_.run(next_lm, residual_hidden, curr_embed);
++      t_proj += tick(t0);
+       lm_hidden = next_projected.fsq_hidden;
++      t0 = std::chrono::steady_clock::now();
+       residual_hidden =
+           residual_lm_.run_step(next_projected.residual_input).hidden;
++      t_res += tick(t0);
+     }
+     return result;
+   }
+@@ -1647,6 +1769,9 @@ private:
+       prompt_audio_embedding_cache_;
+   std::optional<PromptAudioEmbeddingCacheEntry>
+       uncached_prompt_audio_embedding_;
++  // Voicebox: cache embeddingów próbki na dysku (`prompt_disk_cache.h`).
++  std::string disk_cache_dir_;
++  int64_t disk_cache_weight_type_ = 0;
+ };
+ 
+ VoxCPM2FeatureGeneratorRuntime::VoxCPM2FeatureGeneratorRuntime(
+diff --git a/src/models/voxcpm2/loader.cpp b/src/models/voxcpm2/loader.cpp
+index 8902639..b887816 100644
+--- a/src/models/voxcpm2/loader.cpp
++++ b/src/models/voxcpm2/loader.cpp
+@@ -41,6 +41,11 @@ runtime::ModelCliInterface cli(const VoxCPM2Assets &) {
+        "Use tighter graph workspaces and release request runtime graphs; default true."},
+       {"voxcpm2.prompt_cache_slots", "n",
+        "Prompt and prompt-audio embedding cache slots; default 1."},
++      {"voxcpm2.base_lm_weight_type", "native|f32|f16|bf16|q8_0|...",
++       "Weight type of BaseLM only; default = voxcpm2.weight_type."},
++      {"voxcpm2.prompt_disk_cache_dir", "path",
++       "Directory for the on-disk prompt cache (AudioVAE features + LocEnc "
++       "embeddings); empty = off."},
+   };
+   return out;
+ }
+diff --git a/src/models/voxcpm2/minicpm.cpp b/src/models/voxcpm2/minicpm.cpp
+index 0651fa8..baa798a 100644
+--- a/src/models/voxcpm2/minicpm.cpp
++++ b/src/models/voxcpm2/minicpm.cpp
+@@ -178,15 +178,18 @@ std::shared_ptr<const VoxCPM2ModelWeights>
+ load_model_weights(const VoxCPM2Assets &assets,
+                    engine::core::ExecutionContext &execution_context,
+                    size_t weight_context_bytes,
+-                   engine::assets::TensorStorageType storage_type) {
++                   engine::assets::TensorStorageType storage_type,
++                   engine::assets::TensorStorageType base_lm_storage_type) {
+   auto weights = std::make_shared<VoxCPM2ModelWeights>();
+   weights->store = std::make_shared<engine::core::BackendWeightStore>(
+       execution_context.backend(), execution_context.backend_type(),
+       "voxcpm2.model.weights", weight_context_bytes);
+   auto &store = *weights->store;
+   const auto &source = *assets.model_weights;
++  // Voicebox: BaseLM ma WLASNY typ (`voxcpm2.base_lm_weight_type`), reszta
++  // generatora `storage_type` (`voxcpm2.weight_type`).
+   weights->base_lm = load_minicpm_weights(store, source, "base_lm",
+-                                          assets.config.lm, storage_type, true);
++                                          assets.config.lm, base_lm_storage_type, true);
+   weights->residual_lm = load_minicpm_weights(store, source, "residual_lm",
+                                               residual_lm_config(assets.config),
+                                               storage_type, false);
+@@ -269,13 +272,15 @@ public:
+   Impl(std::shared_ptr<const VoxCPM2Assets> assets,
+        engine::core::ExecutionContext &execution_context,
+        size_t weight_context_bytes,
+-       engine::assets::TensorStorageType weight_storage_type)
++       engine::assets::TensorStorageType weight_storage_type,
++       engine::assets::TensorStorageType base_lm_weight_storage_type)
+       : assets_(std::move(assets)), execution_context_(execution_context) {
+     if (assets_ == nullptr) {
+       throw std::runtime_error("VoxCPM2 weights runtime requires assets");
+     }
+     weights_ = load_model_weights(*assets_, execution_context_,
+-                                  weight_context_bytes, weight_storage_type);
++                                  weight_context_bytes, weight_storage_type,
++                                  base_lm_weight_storage_type);
+   }
+ 
+   const VoxCPM2Assets &assets() const noexcept { return *assets_; }
+@@ -300,9 +305,11 @@ VoxCPM2WeightsRuntime::VoxCPM2WeightsRuntime(
+     std::shared_ptr<const VoxCPM2Assets> assets,
+     engine::core::ExecutionContext &execution_context,
+     size_t weight_context_bytes,
+-    engine::assets::TensorStorageType weight_storage_type)
++    engine::assets::TensorStorageType weight_storage_type,
++    engine::assets::TensorStorageType base_lm_weight_storage_type)
+     : impl_(std::make_unique<Impl>(std::move(assets), execution_context,
+-                                   weight_context_bytes, weight_storage_type)) {
++                                   weight_context_bytes, weight_storage_type,
++                                   base_lm_weight_storage_type)) {
+ }
+ 
+ VoxCPM2WeightsRuntime::~VoxCPM2WeightsRuntime() = default;
+@@ -345,6 +352,9 @@ public:
+     if (gallocr_ != nullptr) {
+       ggml_gallocr_free(gallocr_);
+     }
++    if (batch_gallocr_ != nullptr) {
++      ggml_gallocr_free(batch_gallocr_);
++    }
+   }
+ 
+   std::vector<float> embed_token(int32_t token_id) {
+@@ -367,6 +377,79 @@ public:
+     return output;
+   }
+ 
++  // Voicebox: cały tekst jednym grafem (get_rows na n tokenach) — po jednym
++  // tokenie było compute+sync+odczyt na token, 16–38 ms przy 200–500 tokenach.
++  std::vector<float> embed_tokens(const std::vector<int32_t> &token_ids) {
++    const auto &config = weights_->assets().config.lm;
++    const int64_t n = static_cast<int64_t>(token_ids.size());
++    if (n == 0) {
++      return {};
++    }
++    for (const int32_t token_id : token_ids) {
++      if (token_id < 0 || token_id >= config.vocab_size) {
++        throw std::runtime_error(
++            "VoxCPM2 text embedding token id is out of range");
++      }
++    }
++    ggml_init_params params{graph_context_bytes_, nullptr, true};
++    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_batch(
++        ggml_init(params));
++    if (ctx_batch == nullptr) {
++      throw std::runtime_error(
++          "failed to initialize VoxCPM2 batched text embedding graph context");
++    }
++    engine::core::ModuleBuildContext ctx{ctx_batch.get(),
++                                         "voxcpm2.text_embedding_batch"};
++    ggml_tensor *ids = ggml_new_tensor_1d(ctx_batch.get(), GGML_TYPE_I32, n);
++    ggml_set_input(ids);
++    auto tokens = engine::core::wrap_tensor(
++        ids, engine::core::TensorShape::from_dims({n}), GGML_TYPE_I32);
++    auto embedding =
++        engine::modules::EmbeddingModule(
++            {config.vocab_size, config.hidden_size})
++            .build(ctx, tokens, *weights_->weights().base_lm.token_embedding);
++    const float scale =
++        config.use_mup ? static_cast<float>(config.scale_emb) : 1.0F;
++    embedding = scale_tensor(ctx, embedding, scale);
++    embedding = engine::core::reshape_tensor(
++        ctx, ensure_contiguous(ctx, embedding),
++        engine::core::TensorShape::from_dims({n, config.hidden_size}));
++    ggml_tensor *out = embedding.tensor;
++    ggml_set_output(out);
++    if (out->view_src != nullptr) {
++      ggml_set_output(out->view_src);
++    }
++    ggml_cgraph *graph =
++        ggml_new_graph_custom(ctx_batch.get(), kDefaultGraphNodes, false);
++    ggml_build_forward_expand(graph, out);
++    if (batch_gallocr_ == nullptr) {
++      batch_gallocr_ = ggml_gallocr_new(
++          ggml_backend_get_default_buffer_type(weights_->backend()));
++    }
++    if (batch_gallocr_ == nullptr ||
++        !ggml_gallocr_alloc_graph(batch_gallocr_, graph)) {
++      throw std::runtime_error(
++          "failed to allocate VoxCPM2 batched text embedding graph");
++    }
++    ggml_backend_tensor_set(ids, token_ids.data(), 0,
++                            token_ids.size() * sizeof(int32_t));
++    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
++    const ggml_status status =
++        engine::core::compute_backend_graph(weights_->backend(), graph);
++    ggml_backend_synchronize(weights_->backend());
++    if (status != GGML_STATUS_SUCCESS) {
++      engine::core::release_backend_graph_resources(weights_->backend(), graph);
++      throw std::runtime_error(
++          "VoxCPM2 batched text embedding graph compute failed");
++    }
++    std::vector<float> output(static_cast<size_t>(n * config.hidden_size),
++                              0.0F);
++    ggml_backend_tensor_get(out, output.data(), 0,
++                            output.size() * sizeof(float));
++    engine::core::release_backend_graph_resources(weights_->backend(), graph);
++    return output;
++  }
++
+ private:
+   void build(size_t graph_context_bytes) {
+     const auto &config = weights_->assets().config.lm;
+@@ -374,6 +457,7 @@ private:
+       throw std::runtime_error(
+           "VoxCPM2 text embedding graph context bytes must be non-zero");
+     }
++    graph_context_bytes_ = graph_context_bytes;
+     if (!weights_->weights().base_lm.token_embedding.has_value()) {
+       throw std::runtime_error("VoxCPM2 text embedding weight is missing");
+     }
+@@ -435,7 +519,8 @@ private:
+   ggml_tensor *output_ = nullptr;
+   ggml_cgraph *graph_ = nullptr;
+   ggml_backend_buffer_t buffer_ = nullptr;
+-  ggml_gallocr_t gallocr_ = nullptr;
++  ggml_gallocr_t gallocr_ = nullptr;  size_t graph_context_bytes_ = 0;
++  ggml_gallocr_t batch_gallocr_ = nullptr;
+ };
+ 
+ VoxCPM2TextEmbeddingRuntime::VoxCPM2TextEmbeddingRuntime(
+@@ -450,6 +535,11 @@ std::vector<float> VoxCPM2TextEmbeddingRuntime::embed_token(int32_t token_id) {
+   return impl_->embed_token(token_id);
+ }
+ 
++std::vector<float> VoxCPM2TextEmbeddingRuntime::embed_tokens(
++    const std::vector<int32_t> &token_ids) {
++  return impl_->embed_tokens(token_ids);
++}
++
+ struct MiniCPMLayerWithCacheOutput {
+   engine::core::TensorValue output;
+   engine::core::TensorValue key;
+@@ -472,12 +562,11 @@ MiniCPMLayerWithCacheOutput
+ minicpm_prefill_layer(engine::core::ModuleBuildContext &ctx,
+                       const engine::core::TensorValue &input,
+                       const engine::core::TensorValue &positions,
++                      const engine::core::TensorValue &causal_mask,
+                       const VoxCPM2MiniCPMLayerWeights &layer,
+                       const VoxCPM2MiniCPMWeights &weights) {
+   const auto &config = weights.config;
+   const int64_t dim = head_dim(config);
+-  const int64_t kv_repeats =
+-      config.num_attention_heads / config.num_key_value_heads;
+   const engine::modules::AddModule add;
+   auto hidden = engine::modules::RMSNormModule(
+                     {config.hidden_size, config.rms_norm_eps, true, false})
+@@ -503,19 +592,16 @@ minicpm_prefill_layer(engine::core::ModuleBuildContext &ctx,
+   v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
+   auto q_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, q.shape.rank})
+                      .build(ctx, q);
+-  auto k_heads = repeat_kv_heads(
+-      ctx,
++  // Voicebox: flash attention z maską przyczynową zamiast matmul+softmax —
++  // ggml rozgłasza głowice KV sam (bez repeat_kv_heads), wynik od razu [B, S, H, D].
++  const auto k_heads =
+       engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank})
+-          .build(ctx, k),
+-      kv_repeats);
+-  auto v_heads = repeat_kv_heads(
+-      ctx,
++          .build(ctx, k);
++  const auto v_heads =
+       engine::modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank})
+-          .build(ctx, v),
+-      kv_repeats);
+-  auto context = attention_from_heads(ctx, q_heads, k_heads, v_heads, dim, true);
+-  context = engine::modules::TransposeModule({{0, 2, 1, 3}, context.shape.rank})
+-                .build(ctx, context);
++          .build(ctx, v);
++  auto context = flash_attention_from_grouped_heads(ctx, q_heads, k_heads,
++                                                    v_heads, dim, causal_mask);
+   context = engine::core::reshape_tensor(
+       ctx, ensure_contiguous(ctx, context),
+       engine::core::TensorShape::from_dims({input.shape.dims[0],
+@@ -625,6 +711,9 @@ public:
+     ggml_backend_tensor_get(residual_hidden_output_,
+                             output.residual_hidden.data(), 0,
+                             output.residual_hidden.size() * sizeof(float));
++    if (input.keep_state_on_backend) {
++      return output;
++    }
+     output.base_state = read_state(base_keys_, base_values_,
+                                    config.lm.num_key_value_heads *
+                                        head_dim(config.lm));
+@@ -638,6 +727,11 @@ public:
+ 
+   void release_runtime_memory() { release_graph(); }
+ 
++  VoxCPM2PromptPrefillBackendState backend_state() const {
++    return {base_keys_, base_values_, residual_keys_, residual_values_,
++            sequence_steps_};
++  }
++
+ private:
+   engine::runtime::TransformerKVState
+   read_state(const std::vector<ggml_tensor *> &keys,
+@@ -677,6 +771,7 @@ private:
+     text_mask_ = nullptr;
+     audio_mask_ = nullptr;
+     positions_ = nullptr;
++    causal_mask_ = nullptr;
+     lm_hidden_output_ = nullptr;
+     residual_hidden_output_ = nullptr;
+     base_keys_.clear();
+@@ -720,10 +815,17 @@ private:
+     auto positions = engine::core::wrap_tensor(
+         positions_, engine::core::TensorShape::from_dims({steps}),
+         GGML_TYPE_I32);
++    // maska [n_kv = steps, n_q = steps] F16: 0 na i pod przekątną, -inf nad nią
++    causal_mask_ =
++        ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, steps, steps, 1, 1);
++    ggml_set_input(causal_mask_);
++    auto causal_mask = engine::core::wrap_tensor(
++        causal_mask_, engine::core::TensorShape::from_dims({1, 1, steps, steps}),
++        GGML_TYPE_F16);
+     auto base_hidden = input_embeddings;
+     for (const auto &layer : model_weights.base_lm.layers) {
+       auto layer_out = minicpm_prefill_layer(
+-          ctx, base_hidden, positions, layer, model_weights.base_lm);
++          ctx, base_hidden, positions, causal_mask, layer, model_weights.base_lm);
+       base_hidden = layer_out.output;
+       auto *key = ggml_cpy(ctx_.get(), layer_out.key.tensor,
+                            ggml_dup_tensor(ctx_.get(), layer_out.key.tensor));
+@@ -781,7 +883,7 @@ private:
+     auto residual_hidden = residual_input;
+     for (const auto &layer : model_weights.residual_lm.layers) {
+       auto layer_out = minicpm_prefill_layer(
+-          ctx, residual_hidden, positions, layer, model_weights.residual_lm);
++          ctx, residual_hidden, positions, causal_mask, layer, model_weights.residual_lm);
+       residual_hidden = layer_out.output;
+       auto *key = ggml_cpy(ctx_.get(), layer_out.key.tensor,
+                            ggml_dup_tensor(ctx_.get(), layer_out.key.tensor));
+@@ -846,6 +948,13 @@ private:
+     }
+     ggml_backend_tensor_set(positions_, position_ids.data(), 0,
+                             position_ids.size() * sizeof(int32_t));
++    std::vector<ggml_fp16_t> mask(static_cast<size_t>(steps * steps),
++                                  ggml_fp32_to_fp16(-INFINITY));
++    for (int64_t q = 0; q < steps; ++q) {
++      std::fill_n(mask.begin() + q * steps, q + 1, ggml_fp32_to_fp16(0.0F));
++    }
++    ggml_backend_tensor_set(causal_mask_, mask.data(), 0,
++                            mask.size() * sizeof(ggml_fp16_t));
+     sequence_steps_ = steps;
+   }
+ 
+@@ -858,6 +967,7 @@ private:
+   ggml_tensor *text_mask_ = nullptr;
+   ggml_tensor *audio_mask_ = nullptr;
+   ggml_tensor *positions_ = nullptr;
++  ggml_tensor *causal_mask_ = nullptr;
+   ggml_tensor *lm_hidden_output_ = nullptr;
+   ggml_tensor *residual_hidden_output_ = nullptr;
+   std::vector<ggml_tensor *> base_keys_;
+@@ -880,6 +990,11 @@ VoxCPM2PromptPrefillRuntime::run(const VoxCPM2PromptPrefillInput &input) {
+   return impl_->run(input);
+ }
+ 
++VoxCPM2PromptPrefillBackendState
++VoxCPM2PromptPrefillRuntime::backend_state() const {
++  return impl_->backend_state();
++}
++
+ void VoxCPM2PromptPrefillRuntime::release_runtime_memory() {
+   impl_->release_runtime_memory();
+ }
+@@ -920,7 +1035,8 @@ minicpm_layer_with_static_cache(engine::core::ModuleBuildContext &ctx,
+                          positions, weights);
+   v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
+ 
+-  const engine::modules::FastKVSetRowsModule set_rows;
++  const engine::modules::FastKVSetRowsModule set_rows(
++      {engine::modules::FastKVSetRowsMode::BackendViewOptimized});
+   auto updated_key = set_rows.build(ctx, cache_key, k, cache_slot);
+   auto updated_value = set_rows.build(ctx, cache_value, v, cache_slot);
+ 
+@@ -1021,6 +1137,14 @@ public:
+     step_cache_.import_state(state);
+   }
+ 
++  void import_state_from_backend(const std::vector<ggml_tensor *> &keys,
++                                 const std::vector<ggml_tensor *> &values,
++                                 int64_t steps) {
++    ensure_graph();
++    step_cache_.import_prefix_from_backend(weights_->backend(), keys, values,
++                                           steps);
++  }
++
+   engine::runtime::TransformerKVState export_state() const {
+     return step_cache_.export_state();
+   }
+@@ -1141,21 +1265,24 @@ private:
+     cache_keys.reserve(static_cast<size_t>(config.num_hidden_layers));
+     cache_values.reserve(static_cast<size_t>(config.num_hidden_layers));
+     for (const auto &layer : lm_weights.layers) {
++      // KV cache w F16: flash attention czyta go wprost, bez kopii i konwersji.
+       cache_keys.push_back(engine::core::make_tensor(
+-          ctx, GGML_TYPE_F32,
++          ctx, GGML_TYPE_F16,
+           engine::core::TensorShape::from_dims(
+               {1, cache_steps_, config.num_key_value_heads, dim})));
+       cache_values.push_back(engine::core::make_tensor(
+-          ctx, GGML_TYPE_F32,
++          ctx, GGML_TYPE_F16,
+           engine::core::TensorShape::from_dims(
+               {1, cache_steps_, config.num_key_value_heads, dim})));
+       x = minicpm_layer_with_static_cache(
+           ctx, x, position, cache_slot, attention_mask, cache_keys.back(),
+           cache_values.back(), layer, lm_weights);
+     }
++    engine::runtime::TransformerKVCacheOptions kv_options;
++    kv_options.allow_f16_storage = true;
+     step_cache_ = engine::runtime::TransformerKVCache(
+         cache_steps_, config.num_key_value_heads * dim, std::move(cache_keys),
+-        std::move(cache_values));
++        std::move(cache_values), kv_options);
+     x = engine::modules::RMSNormModule(
+             {config.hidden_size, config.rms_norm_eps, true, false})
+             .build(ctx, x, lm_weights.norm);
+@@ -1202,6 +1329,12 @@ void VoxCPM2MiniCPMStepRuntime::import_state(
+   impl_->import_state(state);
+ }
+ 
++void VoxCPM2MiniCPMStepRuntime::import_state_from_backend(
++    const std::vector<ggml_tensor *> &keys,
++    const std::vector<ggml_tensor *> &values, int64_t steps) {
++  impl_->import_state_from_backend(keys, values, steps);
++}
++
+ engine::runtime::TransformerKVState
+ VoxCPM2MiniCPMStepRuntime::export_state() const {
+   return impl_->export_state();
+diff --git a/src/models/voxcpm2/minicpm_blocks.h b/src/models/voxcpm2/minicpm_blocks.h
+index 08ae444..5515585 100644
+--- a/src/models/voxcpm2/minicpm_blocks.h
++++ b/src/models/voxcpm2/minicpm_blocks.h
+@@ -136,9 +136,10 @@ attention_from_heads(engine::core::ModuleBuildContext &ctx,
+     const engine::core::TensorValue &k_heads,
+     const engine::core::TensorValue &v_heads, int64_t dim,
+     const engine::core::TensorValue &attention_mask) {
++  // K/V idą jako widoki (jak w llama.cpp) — bez kopii całego cache co krok.
+   const auto q = ensure_contiguous(ctx, q_heads);
+-  const auto k = ensure_contiguous(ctx, k_heads);
+-  const auto v = ensure_contiguous(ctx, v_heads);
++  const auto &k = k_heads;
++  const auto &v = v_heads;
+   auto *flash = ggml_flash_attn_ext(
+       ctx.ggml, q.tensor, k.tensor, v.tensor, attention_mask.tensor,
+       1.0F / std::sqrt(static_cast<float>(dim)), 0.0F, 0.0F);
+@@ -185,20 +186,35 @@ minicpm_layer(engine::core::ModuleBuildContext &ctx,
+   v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
+   auto q_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, q.shape.rank})
+                      .build(ctx, q);
+-  auto k_heads = repeat_kv_heads(
+-      ctx,
+-      engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank})
+-          .build(ctx, k),
+-      kv_repeats);
+-  auto v_heads = repeat_kv_heads(
+-      ctx,
+-      engine::modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank})
+-          .build(ctx, v),
+-      kv_repeats);
+-  auto context =
+-      attention_from_heads(ctx, q_heads, k_heads, v_heads, dim, is_causal);
+-  context = engine::modules::TransposeModule({{0, 2, 1, 3}, context.shape.rank})
+-                .build(ctx, context);
++  engine::core::TensorValue context;
++  if (!is_causal) {
++    // Flash attention zamiast matmul+softmax: ggml rozgłasza głowice KV sam,
++    // a wynik wychodzi już w układzie [B, S, H, D].
++    const auto k_heads =
++        engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank})
++            .build(ctx, k);
++    const auto v_heads =
++        engine::modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank})
++            .build(ctx, v);
++    context = flash_attention_from_grouped_heads(
++        ctx, q_heads, k_heads, v_heads, dim, engine::core::TensorValue{});
++  } else {
++    auto k_heads = repeat_kv_heads(
++        ctx,
++        engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank})
++            .build(ctx, k),
++        kv_repeats);
++    auto v_heads = repeat_kv_heads(
++        ctx,
++        engine::modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank})
++            .build(ctx, v),
++        kv_repeats);
++    context =
++        attention_from_heads(ctx, q_heads, k_heads, v_heads, dim, is_causal);
++    context =
++        engine::modules::TransposeModule({{0, 2, 1, 3}, context.shape.rank})
++            .build(ctx, context);
++  }
+   context = engine::core::reshape_tensor(
+       ctx, ensure_contiguous(ctx, context),
+       engine::core::TensorShape::from_dims({input.shape.dims[0],
+diff --git a/src/models/voxcpm2/prompt_disk_cache.h b/src/models/voxcpm2/prompt_disk_cache.h
+new file mode 100644
+index 0000000..55bea0c
+--- /dev/null
++++ b/src/models/voxcpm2/prompt_disk_cache.h
+@@ -0,0 +1,164 @@
++#pragma once
++
++// Voicebox: cache próbki głosu NA DYSKU. Zmiana profilu to dwa ciężkie kroki:
++// AudioVAE koduje próbkę na cechy (~1,6 s na 29 s próbki) i LocEnc robi z cech
++// embeddingi dla BaseLM (~0,8 s). Oba wyniki to kilka MB floatów, a cache w RAM
++// trzyma domyślnie jeden profil i znika z procesem — stąd pliki.
++//
++// Klucz = treść (próbki, transkrypt, cechy) + typ wag, który liczył wynik.
++// Katalog podaje wołający (`voxcpm2.prompt_disk_cache_dir`) i to on odpowiada
++// za rozdzielenie różnych modeli. Każdy błąd dysku = zwykły brak w cache,
++// nigdy błąd generacji.
++
++#include "engine/framework/runtime/session.h"
++
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <optional>
++#include <string>
++#include <system_error>
++#include <thread>
++#include <vector>
++
++namespace engine::models::voxcpm2::prompt_disk_cache {
++
++// Dwa FNV-1a 64 z różnymi ziarnami i mnożnikami = 128 bitów nazwy pliku.
++class Hasher {
++public:
++  void bytes(const void *data, size_t size) {
++    const auto *p = static_cast<const unsigned char *>(data);
++    for (size_t i = 0; i < size; ++i) {
++      a_ = (a_ ^ p[i]) * 0x100000001B3ULL;
++      b_ = (b_ ^ p[i]) * 0x9E3779B97F4A7C15ULL;
++    }
++  }
++  void i64(int64_t value) { bytes(&value, sizeof(value)); }
++  void str(const std::string &value) {
++    i64(static_cast<int64_t>(value.size()));
++    bytes(value.data(), value.size());
++  }
++  void floats(const std::vector<float> &values) {
++    i64(static_cast<int64_t>(values.size()));
++    bytes(values.data(), values.size() * sizeof(float));
++  }
++  void audio(const std::optional<runtime::AudioBuffer> &value) {
++    if (!value.has_value()) {
++      i64(-1);
++      return;
++    }
++    i64(value->sample_rate);
++    i64(value->channels);
++    floats(value->samples);
++  }
++  std::string hex() const {
++    static constexpr char kDigits[] = "0123456789abcdef";
++    std::string out;
++    for (const uint64_t word : {a_, b_}) {
++      for (int shift = 60; shift >= 0; shift -= 4) {
++        out.push_back(kDigits[(word >> shift) & 0xF]);
++      }
++    }
++    return out;
++  }
++
++private:
++  uint64_t a_ = 0xCBF29CE484222325ULL;
++  uint64_t b_ = 0x84222325CBF29CE4ULL;
++};
++
++struct Blob {
++  std::vector<int64_t> ints;
++  std::vector<std::vector<float>> arrays;
++};
++
++inline constexpr char kMagic[8] = {'V', 'B', 'X', 'C', 'A', 'C', 'H', '1'};
++
++// Zapis przez plik tymczasowy + rename: czytelnik nigdy nie trafi na połówkę.
++inline bool save(const std::filesystem::path &file, const Blob &blob) {
++  std::error_code ec;
++  std::filesystem::create_directories(file.parent_path(), ec);
++  const auto tmp = file.string() + ".tmp" +
++                   std::to_string(std::hash<std::thread::id>{}(
++                       std::this_thread::get_id()));
++  {
++    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++    if (!out) {
++      return false;
++    }
++    auto put_i64 = [&](int64_t v) {
++      out.write(reinterpret_cast<const char *>(&v), sizeof(v));
++    };
++    out.write(kMagic, sizeof(kMagic));
++    put_i64(static_cast<int64_t>(blob.ints.size()));
++    put_i64(static_cast<int64_t>(blob.arrays.size()));
++    for (const int64_t v : blob.ints) {
++      put_i64(v);
++    }
++    for (const auto &array : blob.arrays) {
++      put_i64(static_cast<int64_t>(array.size()));
++      out.write(reinterpret_cast<const char *>(array.data()),
++                static_cast<std::streamsize>(array.size() * sizeof(float)));
++    }
++    if (!out) {
++      out.close();
++      std::filesystem::remove(tmp, ec);
++      return false;
++    }
++  }
++  std::filesystem::rename(tmp, file, ec);
++  if (ec) {
++    std::filesystem::remove(tmp, ec);
++    return false;
++  }
++  return true;
++}
++
++inline std::optional<Blob> load(const std::filesystem::path &file,
++                                size_t expected_ints, size_t expected_arrays) {
++  std::ifstream in(file, std::ios::binary);
++  if (!in) {
++    return std::nullopt;
++  }
++  char magic[sizeof(kMagic)] = {};
++  in.read(magic, sizeof(magic));
++  if (!in || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) {
++    return std::nullopt;
++  }
++  auto get_i64 = [&](int64_t &v) {
++    in.read(reinterpret_cast<char *>(&v), sizeof(v));
++    return static_cast<bool>(in);
++  };
++  int64_t n_ints = 0;
++  int64_t n_arrays = 0;
++  if (!get_i64(n_ints) || !get_i64(n_arrays) ||
++      n_ints != static_cast<int64_t>(expected_ints) ||
++      n_arrays != static_cast<int64_t>(expected_arrays)) {
++    return std::nullopt;
++  }
++  Blob blob;
++  blob.ints.resize(expected_ints);
++  for (auto &v : blob.ints) {
++    if (!get_i64(v)) {
++      return std::nullopt;
++    }
++  }
++  blob.arrays.resize(expected_arrays);
++  for (auto &array : blob.arrays) {
++    int64_t count = 0;
++    if (!get_i64(count) || count < 0 || count > (int64_t{1} << 31)) {
++      return std::nullopt;
++    }
++    array.resize(static_cast<size_t>(count));
++    in.read(reinterpret_cast<char *>(array.data()),
++            static_cast<std::streamsize>(array.size() * sizeof(float)));
++    if (!in) {
++      return std::nullopt;
++    }
++  }
++  return blob;
++}
++
++} // namespace engine::models::voxcpm2::prompt_disk_cache
+diff --git a/src/models/voxcpm2/session.cpp b/src/models/voxcpm2/session.cpp
+index 19bbf1b..f5709f1 100644
+--- a/src/models/voxcpm2/session.cpp
++++ b/src/models/voxcpm2/session.cpp
+@@ -6,8 +6,11 @@
+ #include "engine/framework/runtime/options.h"
+ #include "engine/framework/text/chunking.h"
+ 
++#include "prompt_disk_cache.h"
++
+ #include <algorithm>
+ #include <chrono>
++#include <filesystem>
+ #include <initializer_list>
+ #include <memory>
+ #include <optional>
+@@ -201,8 +204,10 @@ void validate_session_options(
+         key == "voxcpm2.audiovae_latent_capacity" ||
+         key == "voxcpm2.audiovae_encoder_sample_capacity" ||
+         key == "voxcpm2.weight_type" ||
++        key == "voxcpm2.base_lm_weight_type" ||
+         key == "voxcpm2.audiovae_weight_type" ||
+         key == "voxcpm2.prompt_cache_slots" ||
++        key == "voxcpm2.prompt_disk_cache_dir" ||
+         key == "voxcpm2.mem_saver" ||
+         key == "voxcpm2.denoise" || key == "voxcpm2.load_denoiser") {
+       continue;
+@@ -293,11 +298,22 @@ VoxCPM2SessionBase::VoxCPM2SessionBase(runtime::TaskSpec task,
+                     generator_config_.weight_storage_type);
+   parse_weight_type(options.options, "voxcpm2.audiovae_weight_type",
+                     decoder_config_.weight_storage_type);
++  // Voicebox: osobny typ BaseLM — bez klucza zostaje typ calego generatora.
++  if (options.options.count("voxcpm2.base_lm_weight_type") != 0) {
++    engine::assets::TensorStorageType base_lm_type =
++        generator_config_.weight_storage_type;
++    parse_weight_type(options.options, "voxcpm2.base_lm_weight_type", base_lm_type);
++    generator_config_.base_lm_weight_storage_type = base_lm_type;
++  }
+   if (const auto mem_saver =
+           runtime::find_option(options.options, {"voxcpm2.mem_saver"})) {
+     generator_config_.mem_saver =
+         runtime::parse_bool_option(*mem_saver, "voxcpm2.mem_saver");
+   }
++  if (const auto dir = runtime::find_option(options.options,
++                                            {"voxcpm2.prompt_disk_cache_dir"})) {
++    generator_config_.prompt_disk_cache_dir = *dir;
++  }
+ 
+   generator_ = std::make_unique<VoxCPM2FeatureGeneratorRuntime>(
+       assets_, execution_context(), generator_config_);
+@@ -458,25 +474,37 @@ VoxCPM2SessionBase::run_streaming_request(
+   merged.channels = 1;
+   double decoder_ms = 0.0;
+   size_t emitted_chunks = 0;
++  bool stream_primed = false;
+   auto emit_chunk = [&](const VoxCPM2StreamingChunk &chunk) {
+     const auto decoder_start = Clock::now();
+-    auto audio = decoder_->decode_features(chunk.decode_features,
+-                                           chunk.decode_patches);
+-    if (chunk.context_patches > 0) {
+-      // Left-context patches were decoded for the decoder's history only.
+-      const int64_t context_samples =
+-          chunk.context_patches * assets_->config.patch_size *
+-          product(assets_->config.audio_vae.decoder_rates);
+-      if (context_samples > static_cast<int64_t>(audio.samples.size())) {
+-        throw std::runtime_error(
+-            "VoxCPM2 streaming context trim exceeds chunk audio length");
++    // Stanowy dekoder: każdy kawałek dekodowany raz, ogon trzymają sloty.
++    // Pierwszy kawałek niesie ogon próbki jako kontekst — tylko rozgrzewa stan,
++    // dokładnie jak kontekst w dekodowaniu całości naraz.
++    const int64_t patch_elems =
++        assets_->config.patch_size * assets_->config.audio_vae.latent_dim;
++    auto patch_at = [&](int64_t i) {
++      return std::vector<float>(
++          chunk.decode_features.begin() + static_cast<std::ptrdiff_t>(i * patch_elems),
++          chunk.decode_features.begin() +
++              static_cast<std::ptrdiff_t>((i + 1) * patch_elems));
++    };
++    if (!stream_primed) {
++      decoder_->stream_begin();
++      for (int64_t i = 0; i + 1 < chunk.decode_patches; ++i) {
++        (void)decoder_->decode_stream_patch(patch_at(i));
+       }
+-      audio.samples.erase(audio.samples.begin(),
+-                          audio.samples.begin() +
+-                              static_cast<std::ptrdiff_t>(context_samples));
++      stream_primed = true;
+     }
++    auto audio = decoder_->decode_stream_patch(patch_at(chunk.decode_patches - 1));
+     decoder_ms += engine::debug::elapsed_ms(decoder_start, Clock::now());
+     if (emitted_chunks == 0) {
++      // Voicebox: rozbicie TTFT — dekod pierwszego kawałka (z rozgrzaniem
++      // kontekstem próbki) i czas od wejścia żądania do pierwszego dźwięku.
++      debug::timing_log_scalar("voxcpm2.first_decode_ms",
++                               engine::debug::elapsed_ms(decoder_start, Clock::now()));
++      debug::timing_log_scalar("voxcpm2.first_decode_patches", chunk.decode_patches);
++      debug::timing_log_scalar("voxcpm2.first_audio_ms",
++                               engine::debug::elapsed_ms(wall_start, Clock::now()));
+       merged.sample_rate = audio.sample_rate;
+       merged.channels = audio.channels;
+     } else if (audio.sample_rate != merged.sample_rate ||
+@@ -532,9 +560,18 @@ void VoxCPM2SessionBase::release_request_runtime_memory() {
+ }
+ 
+ const VoxCPM2EncodedPrompt *VoxCPM2SessionBase::encoded_prompt_for_request(
+-    const std::optional<runtime::AudioBuffer> &prompt_audio,
++    const std::optional<runtime::AudioBuffer> &request_prompt_audio,
+     const std::string &prompt_text,
+     const std::optional<runtime::AudioBuffer> &reference_audio) {
++  // Ultimate clone (docs/tts.md): voice_ref + reference_text without separate
++  // prompt audio = the same clip is also the continuation prompt, as upstream
++  // generate(prompt_wav_path=ref, prompt_text=..., reference_wav_path=ref).
++  // Without this the transcript was silently dropped (reference-only mode).
++  const bool reference_as_prompt = !request_prompt_audio.has_value() &&
++                                   reference_audio.has_value() &&
++                                   !prompt_text.empty();
++  const std::optional<runtime::AudioBuffer> &prompt_audio =
++      reference_as_prompt ? reference_audio : request_prompt_audio;
+   if (!prompt_audio.has_value() && !reference_audio.has_value()) {
+     return nullptr;
+   }
+@@ -556,8 +593,40 @@ const VoxCPM2EncodedPrompt *VoxCPM2SessionBase::encoded_prompt_for_request(
+ 
+   const auto encode_start = Clock::now();
+   EncodedPromptCacheEntry entry;
+-  entry.encoded =
+-      decoder_->encode_prompt_audio(prompt_audio, prompt_text, reference_audio);
++  // Voicebox: przed AudioVAE pytamy dysk (`prompt_disk_cache.h`). Cechy zależą
++  // od próbek, transkryptu i typu wag AudioVAE.
++  std::filesystem::path disk_file;
++  bool disk_hit = false;
++  if (!generator_config_.prompt_disk_cache_dir.empty()) {
++    prompt_disk_cache::Hasher hasher;
++    hasher.str("voxcpm2.encoded_prompt.v1");
++    hasher.i64(static_cast<int64_t>(decoder_config_.weight_storage_type));
++    hasher.str(prompt_text);
++    hasher.audio(prompt_audio);
++    hasher.audio(reference_audio);
++    disk_file = std::filesystem::path(generator_config_.prompt_disk_cache_dir) /
++                (hasher.hex() + ".vae");
++    if (auto blob = prompt_disk_cache::load(disk_file, 2, 2)) {
++      entry.encoded.prompt_text = prompt_text;
++      entry.encoded.prompt_patches = blob->ints[0];
++      entry.encoded.reference_patches = blob->ints[1];
++      entry.encoded.prompt_features = std::move(blob->arrays[0]);
++      entry.encoded.reference_features = std::move(blob->arrays[1]);
++      disk_hit = true;
++    }
++  }
++  if (!disk_hit) {
++    entry.encoded =
++        decoder_->encode_prompt_audio(prompt_audio, prompt_text, reference_audio);
++    if (!disk_file.empty()) {
++      prompt_disk_cache::save(
++          disk_file, {{entry.encoded.prompt_patches,
++                       entry.encoded.reference_patches},
++                      {entry.encoded.prompt_features,
++                       entry.encoded.reference_features}});
++    }
++  }
++  debug::trace_log_scalar("voxcpm2.prompt_cache.disk_hit", disk_hit ? 1 : 0);
+   const double encode_ms = engine::debug::elapsed_ms(encode_start);
+   if (encoded_prompt_cache_.capacity() == 0) {
+     uncached_encoded_prompt_ = std::move(entry);

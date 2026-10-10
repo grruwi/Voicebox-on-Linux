@@ -1,0 +1,61 @@
+# Voicebox + silnik mowy audio.cpp (VoxCPM2 / OmniVoice) + whisper.cpp — wszystko na Vulkanie.
+#
+#   ./pobierz-modele.sh          # raz: wagi do ./modele (~7 GB)
+#   docker compose up -d --build # pierwszy build kilka–kilkanaście min (kompilacja silnika i whispera)
+#
+# Panel: http://localhost:17493  — dane (profile glosow, baza, generacje) w ./dane/voicebox
+
+name: voicebox-vulkan
+
+services:
+  voicebox:
+    build: ./voicebox
+    ports:
+      - "17493:17493"
+    volumes:
+      - ./dane/voicebox:/app/data
+      - ./modele:/modele:ro
+      # Glos z MCP (`voicebox_speak`) gra na glosnikach SERWERA przez PulseAudio/PipeWire.
+      # Odkomentuj na maszynie z dzwiekiem (1000 = UID twojego usera):
+      # - /run/user/1000/pulse/native:/run/pulse/native
+    environment:
+      # - PULSE_SERVER=unix:/run/pulse/native
+      # Refine transkrypcji przez LLM — dowolny serwer zgodny z OpenAI (LM Studio, Ollama…), w .env
+      - VOICEBOX_LLM_ENGINE=lmstudio_llm
+      - LMSTUDIO_BASE_URL=${LMSTUDIO_BASE_URL:-}
+      - LMSTUDIO_API_KEY=${LMSTUDIO_API_KEY:-}
+    depends_on:
+      - audiocpp
+      - whisper
+    restart: unless-stopped
+
+  # Silnik mowy. Voicebox wysyla zarzadcy (17495) JEDEN model naraz — Vox albo OmniVoice,
+  # zaladowanie jednego zdejmuje drugi. Sam silnik slucha na 17496.
+  audiocpp:
+    build: ./audiocpp
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./modele:/modele:ro
+      # probki glosow z profili Voiceboxa (tylko odczyt) + cache cech probek (zapis)
+      - ./dane/voicebox:/app/data:ro
+      - ./dane/voicebox/cache/audiocpp-probki:/app/data/cache/audiocpp-probki
+      - ./dane/audiocpp-cache:/cache
+    init: true
+    restart: unless-stopped
+    # ── NVIDIA (niesprawdzone): Vulkan dla NVIDII daje nvidia-container-toolkit z hosta.
+    # Zamiast `devices` wyzej (to samo w `whisper`):
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+    #   - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility
+
+  whisper:
+    build: ./whisper
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./modele/whisper-cpp/wagi:/whisper/wagi:ro
+      - ./dane/whisper:/dane
+    init: true
+    restart: unless-stopped
