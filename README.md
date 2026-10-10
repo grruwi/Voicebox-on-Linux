@@ -49,6 +49,42 @@ Pierwsze ładowanie modelu trwa kilka sekund. Przy pierwszym starcie Vulkan komp
 Ustawienia → zakładki **Vox / OmniVoice / Whisper**: kwantyzacja, flash attention, kroki dyfuzji,
 CFG, tempo mowy, guziki Przeładuj/Rozładuj.
 
+## API
+
+Na porcie panelu (17493) są dwa API. Oba idą do tej samej kolejki i tego samego silnika.
+
+### Zgodne z OpenAI — dla innych programów
+
+Dla wszystkiego, co zna standard OpenAI (Open WebUI, SillyTavern, Newelle…).
+Adres bazowy `http://<host>:17493/v1`, klucz API dowolny (nie jest sprawdzany).
+
+| endpoint | co robi |
+|---|---|
+| `POST /v1/audio/speech` | mowa; `input` = tekst, `voice` = nazwa profilu w Voiceboxie (puste = domyślny), `response_format` = `mp3` (domyślnie) / `opus` / `aac` / `flac` / `wav` / `pcm` |
+| `POST /v1/audio/transcriptions` | rozpoznawanie mowy (whisper wybrany w panelu); `response_format` = `json` / `text` / `verbose_json` |
+| `GET /v1/audio/voices` | lista profili |
+| `GET /v1/audio/models` | jeden model `voicebox` |
+
+`model` i `speed` są ignorowane: silnik (Vox albo OmniVoice) bierze się z profilu,
+a tempo i reszta pokręteł z panelu. `instructions` (opis stylu) działa tylko z Voxem.
+
+```bash
+curl http://<host>:17493/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"input": "Cześć, tu Voicebox.", "voice": "mój profil"}' -o mowa.mp3
+```
+
+**Open WebUI:** Panel administratora → Ustawienia → Audio → TTS i STT: silnik *OpenAI*,
+URL `http://<host>:17493/v1`, klucz cokolwiek, głos = nazwa profilu.
+
+### Własne API Voiceboxa
+
+To, czego używa panel: wybór silnika na jedno zapytanie, seed, efekty, historia generacji,
+strumień kawałkami. Pełna lista z opisami: `http://<host>:17493/docs`.
+
+### MCP
+
+`http://<host>:17493/mcp` — narzędzia dla agentów AI (`voicebox_speak`, `voicebox_transcribe`…).
+
 ## Uwagi
 
 - **Backend** w zakładce Ogólne zostaw na **Vulkan**. Opcja ROCm działa tylko z wariantem ROCm (niżej).
