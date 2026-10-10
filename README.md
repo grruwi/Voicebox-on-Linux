@@ -5,6 +5,8 @@
 z [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Bez PyTorcha. Całość chodzi na Vulkanie,
 więc wystarczy dowolna karta z Vulkanem.
 
+Nieoficjalna przeróbka, niezwiązana z autorami Voiceboxa ani audio.cpp — błędy zgłaszaj tutaj, nie u nich.
+
 Silniki mowy (oba klonują głos z próbki):
 - **VoxCPM2**: streaming, pierwszy dźwięk po ~0,2 s; precyzja wag (q8/f16/f32) do wyboru w panelu;
 - **OmniVoice** (k2-fsa): dyfuzja, generuje całą wypowiedź naraz, ~3× szybciej niż czas mowy;
@@ -25,7 +27,7 @@ Trzy kontenery:
   - **AMD i Intel** działają od ręki (sterownik Mesa jest w obrazie, nowy, z trixie-backports);
   - **NVIDIA** jest niesprawdzona: potrzebny `nvidia-container-toolkit`, a w `docker-compose.yml` jest zakomentowany wariant;
 - VRAM: Vox ~4–5 GB, OmniVoice ~3 GB, Whisper large-v3 q5 ~1,6 GB (Vox i OmniVoice nigdy naraz);
-- dysk: ~7,4 GB na wagi, ~3 GB na obrazy.
+- dysk: ~7,4 GB na wagi, ~3 GB na obrazy (z wariantem ROCm ~6,3 GB).
 
 ## Start
 
@@ -49,12 +51,25 @@ CFG, tempo mowy, guziki Przeładuj/Rozładuj.
 
 ## Uwagi
 
-- **Backend** w zakładce Ogólne zostaw na **Vulkan**. Obraz ma tylko binarkę Vulkan; ROCm/HIP to wariant, który u mnie buduje się osobno.
+- **Backend** w zakładce Ogólne zostaw na **Vulkan**. Opcja ROCm działa tylko z wariantem ROCm (niżej).
 - **Vox PyTorch** na liście silników potrzebuje osobnego kontenera z PyTorchem i ROCm. Tu go nie ma, nie wybieraj.
 - **Port 17493 nie ma logowania.** Nie wystawiaj go do internetu bez reverse proxy z autoryzacją.
 - `voicebox_speak` przez MCP gra na głośnikach **serwera**. Jeśli serwer ma dźwięk, odkomentuj w compose montaż socketu PulseAudio.
 - Dane trzyma `./dane/voicebox`: baza, profile i wygenerowane pliki. Kopia zapasowa = kopia tego katalogu.
 - Wagi VoxCPM2 to oryginał BF16. Silnik przepisuje go do wybranej precyzji przy każdym ładowaniu (~7 s z cache dysku).
+
+## Opcjonalnie: ROCm (tylko Radeony)
+
+**Niepotrzebne do działania** — Vulkan chodzi na każdej karcie i na RX 9070 XT był u nas szybszy.
+Wariant ROCm dokłada do silnika binarkę HIP na ROCm 10 (TheRock), a Vulkan zostaje obok;
+przełącza się w panelu (Ustawienia → Ogólne → Backend), bez przebudowy.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
+```
+
+Build pobiera ROCm (~2,4 GB na rodzinę kart, domyślnie RX 9000 + RX 7000) i kompiluje dłużej.
+Inne karty: `ROCM_RODZINY` i `GPU_TARGETS` w `docker-compose.rocm.yml`.
 
 ## Co jest zmienione względem upstreamów
 
@@ -68,3 +83,16 @@ CFG, tempo mowy, guziki Przeładuj/Rozładuj.
   - backend gada z audio.cpp i whisper.cpp po HTTP;
   - panel ma zakładki silników;
   - lista silników jest okrojona do VoxCPM2 i OmniVoice.
+
+## Licencje
+
+- `voicebox/` — Voicebox, [MIT](voicebox/LICENSE), © Voicebox Contributors; nasze zmiany na tej samej licencji.
+- audio.cpp — [Apache 2.0](audiocpp/LICENSE-audio.cpp), © ShugoAI LLC. Kod pobiera się przy buildzie;
+  `audiocpp/latki-voicebox.patch` to nasze zmiany w ich plikach (Apache 2.0).
+- whisper.cpp — MIT, pobierany przy buildzie.
+- ROCm (tylko wariant ROCm) — AMD, licencje w paczce, pobierany przy buildzie.
+
+## Autorzy
+
+Złożył [grruwi](https://github.com/grruwi) razem z Claude (Claude Code, Anthropic) —
+łatki silnika, kontenery i przeróbki Voiceboxa powstawały we dwóch.

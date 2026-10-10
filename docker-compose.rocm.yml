@@ -1,0 +1,22 @@
+# OPCJONALNY wariant ROCm — NIE jest potrzebny, Vulkan dziala na kazdej karcie.
+# Tylko Radeony: dokłada binarke HIP (ROCm 10, TheRock) obok Vulkana, a przelacznik
+# siedzi w panelu (Ustawienia → Ogolne → Backend). Build pobiera ~2,4 GB ROCm na
+# rodzine kart i kompiluje dluzej.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
+# albo na stale w .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.rocm.yml
+
+services:
+  audiocpp:
+    build:
+      target: rocm
+      # Domyslnie RX 9000 + RX 7000. Inne karty — rodziny z
+      # https://rocm.prereleases.amd.com/tarball-multi-arch/ i ich gfx:
+      # args:
+      #   ROCM_RODZINY: "gfx103X-all"
+      #   GPU_TARGETS: "gfx1030"
+    devices:
+      - /dev/kfd:/dev/kfd
+    # domyslny profil seccomp Dockera blokuje czesc syscalli kolejek HSA
+    security_opt:
+      - seccomp:unconfined

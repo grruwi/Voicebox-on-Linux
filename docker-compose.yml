@@ -32,7 +32,9 @@ services:
   # Silnik mowy. Voicebox wysyla zarzadcy (17495) JEDEN model naraz — Vox albo OmniVoice,
   # zaladowanie jednego zdejmuje drugi. Sam silnik slucha na 17496.
   audiocpp:
-    build: ./audiocpp
+    build:
+      context: ./audiocpp
+      target: vulkan    # rocm = opcjonalny wariant, patrz docker-compose.rocm.yml
     devices:
       - /dev/dri:/dev/dri
     volumes:
