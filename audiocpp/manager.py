@@ -20,7 +20,7 @@ Routes (port 17495):
                   loads BEFORE the port opens)
   POST /unload    stops the process
 
-The engine itself listens on 17496 in the `glos` network — Voicebox talks to it directly
+The engine itself listens on 17496 in the compose network — Voicebox talks to it directly
 (`/v1/audio/speech`, `/v1/models`, `/v1/tasks/unload_models`), not through here.
 Engine log: /tmp/tts-server.log in the container (`docker exec audiocpp-backend tail ...`).
 """

@@ -62,7 +62,7 @@ Vox and OmniVoice never sit on the card together (unless you turn the Offloader 
 ```bash
 git clone https://github.com/grruwi/voicebox-audiocpp.git
 cd voicebox-audiocpp
-./download-models.sh            # minimum ~7.4 GB; `./download-models.sh all` = every variant
+./download-models.sh            # minimum ~11 GB; `all` = every variant, `pytorch` = the PyTorch engine
 cp .env.example .env            # optional: an LLM server for transcript refine
 docker compose up -d --build    # the first build compiles audio.cpp and whisper.cpp
 ```
@@ -80,6 +80,14 @@ Prebuilt sets save resources big time. Without them the engine takes the BF16 or
 converts it into the panel's precision **on every load** — slow, and RAM can spike hard while
 both copies sit in memory. With them a Vox load is ~2 s instead of ~7 s (~23 s from a cold disk).
 On PyTorch they are also faster, and **required** (the worker loads only prebuilt sets).
+
+**Download ours** — cut the way the panel splits the model (BaseLM × acoustic, 4 sets each):
+[VoxCPM2-audiocpp-prebuilt](https://huggingface.co/grruwi/VoxCPM2-audiocpp-prebuilt) and
+[VoxCPM2-pytorch-prebuilt](https://huggingface.co/grruwi/VoxCPM2-pytorch-prebuilt).
+`download-models.sh` fetches the q8/f16 set by default (`all` / `pytorch-all` = every set).
+The `.pt` files load with `weights_only=True` — no code runs from them.
+
+**Or make them yourself** from the original:
 
 ```bash
 # audio.cpp: <base_lm> q8_0|f16|f32, <acoustic> f16|f32 → models/audiocpp/prebuilt/<set>/
@@ -117,7 +125,7 @@ LoRA), at the cost of resources (table above).
 docker compose -f docker-compose.yml -f docker-compose.pytorch.yml up -d --build
 ```
 
-Then make the prebuilt sets (above). The image carries a prebuilt kernel package per card
+That fetches the original + the q8/f16 set (`pytorch-all` = all four). The image carries a prebuilt kernel package per card
 (RX 9070 XT + RX 7900 XTX by default, ~0.6–0.7 GB each) — another card = add its package in
 `pytorch/Dockerfile`. The first load compiles (`torch.compile`); after that it runs from the caches.
 

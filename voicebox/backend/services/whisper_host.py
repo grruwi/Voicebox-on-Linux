@@ -42,7 +42,7 @@ DEVICES = ("gpu", "cpu")
 # Defaults = what the host's whisper ran on (large-v3-q5_0 on the GPU).
 _DEFAULTS = ("large", "q5", "gpu")
 
-# The `glos` Docker network (shared with the `whisper` container). From the host: 127.0.0.1:17480.
+# The compose network (shared with the `whisper` container). From the host: 127.0.0.1:17480.
 MANAGER = os.environ.get("WHISPER_MANAGER", "http://whisper:17480").strip().rstrip("/")
 TRANSCRIBE_PATH = "/v1/audio/transcriptions"
 URL = MANAGER + TRANSCRIBE_PATH
