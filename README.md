@@ -15,6 +15,9 @@ Voices (both clone from a sample):
 - **VoxCPM2**: streaming, first sound after ~0.2 s; weight precision (q8/f16/f32) picked in the panel;
 - **OmniVoice** (k2-fsa): diffusion, the whole utterance at once, ~3× faster than real time;
   q8 or f16, optional chunked streaming (by lines or sentences).
+  ⚠️ OmniVoice sets the utterance length up front from the sample's pace (pauses, breaths and laughs
+  included), so it tends to sound natural only at high speed — around 1.5–1.7 in the panel;
+  at 1.0 it fills the extra time with silence.
 
 Sample editor next to each profile: select on the waveform, cut, loop, A/B with the original,
 Ctrl+Z/Y, live filters — de-esser, de-click, treble shelf, gate (ffmpeg).
