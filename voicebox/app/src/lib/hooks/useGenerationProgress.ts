@@ -3,6 +3,7 @@ import { useEffect, useRef } from 'react';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
+import { grajStrumien, zagranoStrumieniem, zatrzymajStrumienie } from '@/lib/utils/strumienMowy';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
 
@@ -41,6 +42,11 @@ export function useGenerationProgress() {
   isPlayingRef.current = isPlaying;
   autoplayRef.current = autoplayOnGenerate;
 
+  // Uzytkownik puscil cos w glownym odtwarzaczu — strumien mowy milknie, nie gra pod spodem.
+  useEffect(() => {
+    if (isPlaying) zatrzymajStrumienie();
+  }, [isPlaying]);
+
   // Track active EventSource instances
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
@@ -72,6 +78,12 @@ export function useGenerationProgress() {
 
       const url = apiClient.getGenerationStatusUrl(id);
       const source = new EventSource(url);
+
+      // ⭐ Autoplay zaznaczony = gramy strumieniem w trakcie liczenia (backend oddaje kawalki
+      // zamiast ffplay). 204 z backendu = nie strumieniem; wtedy plik po calosci nizej.
+      if (autoplayRef.current && !isPlayingRef.current) {
+        void grajStrumien(apiClient.getGenerationStreamUrl(id), id);
+      }
 
       source.onmessage = (event) => {
         try {
@@ -120,7 +132,12 @@ export function useGenerationProgress() {
             // Skip agent-initiated sources — the floating pill window
             // plays those itself.
             const isAgentSpeak = data.source ? AGENT_SOURCES.has(data.source) : false;
-            if (autoplayRef.current && !isPlayingRef.current && !isAgentSpeak) {
+            if (
+              autoplayRef.current &&
+              !isPlayingRef.current &&
+              !isAgentSpeak &&
+              !zagranoStrumieniem(id)
+            ) {
               const genAudioUrl = apiClient.getAudioUrl(id);
               setAudioWithAutoPlay(genAudioUrl, id, '', '');
             }

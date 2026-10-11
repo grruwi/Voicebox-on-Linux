@@ -854,7 +854,7 @@
       },
       "autoplay": {
         "title": "Autoplay on generate",
-        "description": "Automatically play audio when a generation completes."
+        "description": "On: the panel plays speech while it is being generated (streamed to the browser). Off: speech plays on the server's speakers."
       },
       "folder": {
         "title": "Generations folder",

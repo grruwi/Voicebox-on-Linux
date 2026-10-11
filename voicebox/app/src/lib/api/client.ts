@@ -389,6 +389,11 @@ class ApiClient {
     return `${this.getBaseUrl()}/generate/${generationId}/status`;
   }
 
+  // Strumien mowy do przegladarki (autoplay zaznaczony) — lib/utils/strumienMowy.ts
+  getGenerationStreamUrl(generationId: string): string {
+    return `${this.getBaseUrl()}/generate/${generationId}/strumien`;
+  }
+
   // Audio
   getAudioUrl(audioId: string): string {
     return `${this.getBaseUrl()}/audio/${audioId}`;

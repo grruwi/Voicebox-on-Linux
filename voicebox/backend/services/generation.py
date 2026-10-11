@@ -24,7 +24,7 @@ import traceback
 from typing import Literal, Optional
 
 from .. import config
-from . import history, pamiec, profiles
+from . import history, pamiec, profiles, strumien_przegladarki
 from ..database import get_db
 from ..utils.tasks import get_task_manager
 
@@ -117,19 +117,25 @@ async def run_generation(
         # backend nie wymagal zmian.
         audio = None
         zagrane_strumieniem = False
-        if (
+        strumieniowalne = (
             mode == "generate"
             and not normalize
             and not effects_chain
             and hasattr(tts_model, "generate_stream")
             and len(text) <= (max_chunk_chars or 800)
             and not _zrodlo_openai(generation_id, bg_db)
-            and (
-                _zrodlo_jest_agenta(generation_id, bg_db)
-                or _zrodlo_twitch(generation_id, bg_db)
-                or not _front_zagra_sam(bg_db)
-            )
-        ):
+        )
+        twitch = strumieniowalne and _zrodlo_twitch(generation_id, bg_db)
+        do_glosnikow = strumieniowalne and (
+            _zrodlo_jest_agenta(generation_id, bg_db)
+            or twitch
+            or not _front_zagra_sam(bg_db)
+        )
+        # ⭐ AUTOPLAY ZAZNACZONY (11.10, grruwi) = generacja z GUI leci strumieniem do
+        # PRZEGLADARKI, nie do `ffplay` — panel gra kawalki w miare liczenia, zamiast
+        # pliku po calosci (`services/strumien_przegladarki.py`). Odznaczony = ffplay.
+        do_przegladarki = strumieniowalne and not do_glosnikow
+        if do_glosnikow or do_przegladarki:
             audio, sample_rate = await _graj_strumieniem(
                 tts_model,
                 text,
@@ -137,9 +143,12 @@ async def run_generation(
                 language=language,
                 seed=seed,
                 instruct=instruct,
-                env=_env_odtwarzacza(_zrodlo_twitch(generation_id, bg_db)),
+                env=_env_odtwarzacza(twitch),
+                przegladarka=generation_id if do_przegladarki else None,
             )
             zagrane_strumieniem = audio is not None
+        else:
+            strumien_przegladarki.odmow(generation_id)
 
         if audio is None:
             audio, sample_rate = await generate_chunked(tts_model, text, voice_prompt, **gen_kwargs)
@@ -313,8 +322,12 @@ async def _graj_strumieniem(
     seed: int | None,
     instruct: str | None,
     env: dict | None = None,
+    przegladarka: str | None = None,
 ):
     """Graj kawalki na glosnikach w miare powstawania; zwroc caly dzwiek.
+
+    `przegladarka` = id generacji: kawalki ida do `strumien_przegladarki` (panel gra
+    je przez Web Audio) ZAMIAST do `ffplay`.
 
     Dwie rzeczy naraz: bajty ida do `ffplay` przez rure, a kopia laduje w
     liscie — inaczej nie byloby czego zapisac do historii i `/audio/{id}`
@@ -331,22 +344,26 @@ async def _graj_strumieniem(
 
     czestotliwosc = getattr(backend, "SAMPLE_RATE", 48000)
     odtwarzacz = None
+    strumien = None
     kawalki: list = []
 
     try:
-        # ⛔ Bez `-probesize 32 -analyzeduration 0 -fflags nobuffer` ffplay „bada”
-        # rurę, aż uzbiera kilka sekund dźwięku, i dopiero wtedy otwiera wyjście:
-        # zmierzone 30.09 — strumień w PipeWire +3,4 s po POST, choć TTFT 0,2 s.
-        # Z flagami otwiera się 1 ms po pierwszym kawałku.
-        odtwarzacz = subprocess.Popen(
-            ["ffplay", "-f", "f32le", "-ar", str(czestotliwosc), "-ch_layout", "mono",
-             "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
-             "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"],
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if przegladarka:
+            strumien = strumien_przegladarki.otworz(przegladarka, czestotliwosc)
+        else:
+            # ⛔ Bez `-probesize 32 -analyzeduration 0 -fflags nobuffer` ffplay „bada”
+            # rurę, aż uzbiera kilka sekund dźwięku, i dopiero wtedy otwiera wyjście:
+            # zmierzone 30.09 — strumień w PipeWire +3,4 s po POST, choć TTFT 0,2 s.
+            # Z flagami otwiera się 1 ms po pierwszym kawałku.
+            odtwarzacz = subprocess.Popen(
+                ["ffplay", "-f", "f32le", "-ar", str(czestotliwosc), "-ch_layout", "mono",
+                 "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
+                 "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
         _t_zadanie = time.perf_counter()
         async for kawalek in backend.generate_stream(
@@ -360,6 +377,9 @@ async def _graj_strumieniem(
                     time.perf_counter() - _t_zadanie, len(text),
                 )
             kawalki.append(kawalek)
+            if strumien is not None:
+                strumien.dodaj(kawalek.tobytes())
+                continue
             try:
                 # ⛔ W WATKU, nie wprost. Rura do ffplay ma ~64 KB (0,3 s dzwieku),
                 # a ffplay czyta w tempie odtwarzania — `write` blokuje, az dogra.
@@ -374,6 +394,8 @@ async def _graj_strumieniem(
 
         if odtwarzacz is not None:
             odtwarzacz.stdin.close()
+        if strumien is not None:
+            strumien.zakoncz()
 
         if not kawalki:
             return None, 0
@@ -383,12 +405,19 @@ async def _graj_strumieniem(
 
     except Exception:
         logger.exception("Strumien nie wyszedl — wracam do zwyklej generacji")
+        if strumien is not None:
+            strumien.zakoncz(blad=True)
         if odtwarzacz is not None:
             try:
                 odtwarzacz.kill()
             except Exception:
                 pass
         return None, 0
+    finally:
+        # Anulowana generacja (CancelledError nie jest Exception) — przegladarka
+        # czekalaby na kolejny kawalek w nieskonczonosc.
+        if strumien is not None and not strumien.koniec:
+            strumien.zakoncz(blad=True)
 
 
 def _autoplay_if_agent(

@@ -90,6 +90,7 @@ strumień kawałkami. Pełna lista z opisami: `http://<host>:17493/docs`.
 
 - **Backend** w zakładce Ogólne zostaw na **Vulkan**. Opcja ROCm działa tylko z wariantem ROCm (niżej).
 - **Vox PyTorch** na liście silników potrzebuje osobnego kontenera z PyTorchem i ROCm. Tu go nie ma, nie wybieraj.
+- **Autoplay on generate** (Ustawienia → Ogólne): zaznaczony = panel gra mowę strumieniem w przeglądarce, w trakcie liczenia (pierwszy dźwięk ~0,2 s z Voxem); odznaczony = mowa gra na głośnikach serwera.
 - **Port 17493 nie ma logowania.** Nie wystawiaj go do internetu bez reverse proxy z autoryzacją.
 - `voicebox_speak` przez MCP gra na głośnikach **serwera**. Jeśli serwer ma dźwięk, odkomentuj w compose montaż socketu PulseAudio.
 - Dane trzyma `./dane/voicebox`: baza, profile i wygenerowane pliki. Kopia zapasowa = kopia tego katalogu.

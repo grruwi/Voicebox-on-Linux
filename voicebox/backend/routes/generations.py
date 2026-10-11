@@ -273,6 +273,46 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
     return {"message": "Generation cancellation requested"}
 
 
+# ⭐ STRUMIEN DO PRZEGLADARKI (11.10) — „autoplay on generate" zaznaczony: panel gra kawalki
+# w miare liczenia (`services/strumien_przegladarki.py`). 204 = ta generacja nie idzie
+# strumieniem (odznaczony autoplay → ffplay, za dlugi tekst, efekty, retry) — panel gra plik.
+@router.get("/generate/{generation_id}/strumien")
+async def strumien_przegladarki_endpoint(generation_id: str, db: Session = Depends(get_db)):
+    """4 bajty czestotliwosci (uint32 LE) + surowe f32le mono, w miare liczenia."""
+    import time
+
+    from fastapi import Response
+    from ..services import strumien_przegladarki
+
+    # Generacja moze stac w kolejce za inna — czekamy na decyzje `run_generation`.
+    termin = time.monotonic() + 600
+    nastepny_odczyt_bazy = 0.0
+    while True:
+        znana, strumien = strumien_przegladarki.pobierz(generation_id)
+        if znana:
+            break
+        teraz = time.monotonic()
+        if teraz > termin:
+            return Response(status_code=204)
+        if teraz >= nastepny_odczyt_bazy:
+            nastepny_odczyt_bazy = teraz + 0.25
+            db.expire_all()
+            status = db.query(DBGeneration.status).filter_by(id=generation_id).scalar()
+            if status is None and not db.query(DBGeneration.id).filter_by(id=generation_id).first():
+                raise HTTPException(status_code=404, detail="Generation not found")
+            if status in ("completed", "failed"):
+                return Response(status_code=204)
+        await asyncio.sleep(0.02)
+
+    if strumien is None:
+        return Response(status_code=204)
+    return StreamingResponse(
+        strumien.czytaj(),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/generate/{generation_id}/status")
 async def get_generation_status(generation_id: str, db: Session = Depends(get_db)):
     """SSE endpoint that streams generation status updates."""
