@@ -1,7 +1,7 @@
 """VoxCPM2 worker of the `pytorch` container — a thin HTTP layer over `voxcpm.VoxCPM`.
 
 Started by `manager.py`: the precision set comes in `WORKER_OPTIONS`
-(`{"base_lm": "q8"|"f16", "acoustic": "f16"|"f32", "cuda_graphs": true}`), the model
+(`{"base_lm": "q8"|"f16", "acoustic": "f16"|"f32", "cuda_graphs": true, "compile": true}`), the model
 loads during startup, and the port opens only once it is ready. Another set = the
 manager starts a new process; this one never swaps models.
 
@@ -47,7 +47,8 @@ precision = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     options = json.loads(os.environ.get("WORKER_OPTIONS") or "{}")
-    _load(options.get("base_lm"), options.get("acoustic"), options.get("cuda_graphs") is not False)
+    _load(options.get("base_lm"), options.get("acoustic"), options.get("cuda_graphs") is not False,
+          options.get("compile") is not False)
     yield
     global model
     model = None
@@ -65,7 +66,6 @@ app = FastAPI(lifespan=lifespan)
 # on-disk caches (`inductor-cache`, `triton-cache`).
 
 PREBUILT_DIR = Path(os.environ.get("VOXCPM_PREBUILT", "/prebuilt"))
-DENOISER = "iic/speech_zipenhancer_ans_multiloss_16k_base"
 # Encoded voice samples (see prompt_cache.py) — a mounted dir, survives restarts.
 PROMPT_CACHE_DIR = Path(os.environ.get("VOXCPM_PROMPT_CACHE", "/prompt-cache"))
 
@@ -97,10 +97,10 @@ def _compile_without_graphs(tm) -> None:
     tm.feat_decoder.estimator = torch.compile(tm.feat_decoder.estimator, fullgraph=True)
 
 
-def _load(base_lm: Optional[str], acoustic: Optional[str], cuda_graphs: bool = True) -> None:
+def _load(base_lm: Optional[str], acoustic: Optional[str], cuda_graphs: bool = True,
+          compile_model: bool = True) -> None:
     global model, precision
     from voxcpm import VoxCPM
-    from voxcpm.zipenhancer import ZipEnhancer
 
     from precision import ACOUSTIC, BASE_LM, load, report, set_name, wire_up
 
@@ -124,15 +124,23 @@ def _load(base_lm: Optional[str], acoustic: Optional[str], cuda_graphs: bool = T
     from prompt_cache import enable_prompt_cache
 
     enable_prompt_cache(tm, PROMPT_CACHE_DIR)
-    if cuda_graphs:
+    # `compile: false` = eager, no torch.compile at all (no Dynamo trace on every load).
+    if not compile_model:
+        mode = "off (eager)"
+    elif cuda_graphs:
         tm.optimize()
+        mode = "reduce-overhead (CUDA graphs)"
     else:
         _compile_without_graphs(tm)
-    print(f"[voxcpm2] compile: {'reduce-overhead (CUDA graphs)' if cuda_graphs else 'no CUDA graphs'}", flush=True)
+        mode = "no CUDA graphs"
+    print(f"[voxcpm2] compile: {mode}", flush=True)
     # Same warm-up as upstream with `optimize=True` — compiles the graphs.
     tm.generate(target_text="Hello, this is the first test sentence.", max_len=10)
     m = VoxCPM.__new__(VoxCPM)
-    m.tts_model, m.text_normalizer, m.denoiser = tm, None, ZipEnhancer(DENOISER)
+    # ⛔ No denoiser (ZipEnhancer, 11.10, grruwi's call): 7.8 s of every load (import +
+    # ModelScope pipeline), cleans only the profile sample, and in his listening it
+    # provoked hallucinations. `denoise` in a request is ignored.
+    m.tts_model, m.text_normalizer, m.denoiser = tm, None, None
     model, precision = m, (base_lm, acoustic)
     _kill_compile_workers()
     print(report(tm), flush=True)
@@ -148,7 +156,6 @@ class Request(BaseModel):
     cfg_value: Optional[float] = None
     inference_timesteps: Optional[int] = None
     normalize: Optional[bool] = None
-    denoise: Optional[bool] = None
     retry_badcase: Optional[bool] = None
     seed: Optional[int] = None
 
@@ -198,7 +205,7 @@ def _save(data_b64: str, directory: str, name: str) -> str:
 
 def _params(request: Request, directory: str) -> dict:
     params = {"text": request.text}
-    for name in ("cfg_value", "inference_timesteps", "normalize", "denoise", "retry_badcase"):
+    for name in ("cfg_value", "inference_timesteps", "normalize", "retry_badcase"):
         value = getattr(request, name)
         if value is not None:
             params[name] = value

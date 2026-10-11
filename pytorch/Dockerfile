@@ -56,6 +56,13 @@ RUN pip install --no-cache-dir -c /opt/torch-pinned.txt \
         librosa argbind datasets simplejson pillow sortedcontainers \
     && pip install --no-cache-dir --no-deps voxcpm
 
+# torchcodec — voxcpm lists it, `--no-deps` above skipped it. torchaudio ≥ 2.9 loads audio
+# ONLY through it (`torchaudio.load` → the denoiser crashed: "TorchCodec is required").
+# The CPU build from PyTorch's index: the PyPI wheel links CUDA (libnvrtc) and does not
+# load on ROCm. Decoding runs on the CPU anyway; FFmpeg comes from apt above.
+RUN pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu \
+        "torchcodec==0.17.0+cpu"
+
 COPY manager.py /app/manager.py
 COPY workers/ /app/workers/
 

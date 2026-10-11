@@ -76,7 +76,6 @@ class VoxCPMPyTorchBackend:
         ("cfg_value", "VOXCPM_PT_CFG"),
         ("inference_timesteps", "VOXCPM_PT_TIMESTEPS"),
         ("normalize", "VOXCPM_PT_NORMALIZE"),
-        ("denoise", "VOXCPM_PT_DENOISE"),
         ("retry_badcase", "VOXCPM_PT_RETRY_BADCASE"),
     )
 
@@ -152,7 +151,12 @@ class VoxCPMPyTorchBackend:
         except Exception as error:
             logger.debug("precision not from the database (%s) — q8/f16", error)
         # BaseLM f32 was cut from the panel (11.10, grruwi's call); the worker knows q8 | f16.
-        return {"base_lm": base_lm if base_lm in ("q8", "f16") else "q8", "acoustic": acoustic}
+        # ⛔ CUDA graphs OFF (11.10, grruwi's call, "for now"): measured on q8-f16 and
+        # f16-f16 at 30 steps — same RTF, same first sound, same load, ~200 MB less VRAM.
+        # `"compile": False` would skip torch.compile entirely: load 11 → 6.8 s, but short
+        # and medium texts ~15–20% slower (RTF) and the first sound +50 ms (measured 11.10).
+        return {"base_lm": base_lm if base_lm in ("q8", "f16") else "q8", "acoustic": acoustic,
+                "cuda_graphs": False}
 
     # -------------------------------------------------------------- life
 
