@@ -106,7 +106,7 @@ def load(path, weights_dir: str, device: str = "cuda"):
     with open(f"{weights_dir}/config.json", encoding="utf-8") as f:
         config = VoxCPMConfig.model_validate_json(f.read())
     tokenizer = LlamaTokenizerFast.from_pretrained(weights_dir)
-    data = torch.load(path, map_location=device, weights_only=False)
+    data = torch.load(path, map_location=device, weights_only=True)
     # Sets built by the old `voxcpm-pt` container (still in use) keep its key names.
     for old_key, key in (("stan", "state"), ("bufory", "buffers")):
         if old_key in data:
