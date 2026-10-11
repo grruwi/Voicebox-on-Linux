@@ -61,6 +61,11 @@ class SpeechRequest(BaseModel):
     response_format: str = "mp3"
     instructions: str | None = None
     speed: float | None = None  # Vox has no speed as a number — ignored
+    # ⭐ Real streaming (11.10): `stream: true` or `stream_format` = the sound goes out while
+    # it is computed. "audio" = the encoded bytes as they come, "sse" = OpenAI's
+    # `speech.audio.delta` events (base64). Nothing set = the whole file at the end, as before.
+    stream: bool | None = None
+    stream_format: str | None = None
 
 
 def _panel_settings(db: Session) -> dict:
@@ -165,6 +170,12 @@ async def speech(data: SpeechRequest, db: Session = Depends(get_db)):
 
     from .generations import generate_speech
 
+    stream_format = (data.stream_format or ("audio" if data.stream else "")).lower()
+    if stream_format and stream_format not in ("audio", "sse"):
+        raise HTTPException(status_code=400, detail="`stream_format`: audio or sse.")
+    if stream_format:
+        return await _speech_streamed(profile, text, instruct, format_, stream_format, db)
+
     # Subscribe BEFORE queueing — otherwise a short generation could finish before
     # we start listening.
     queue = mcp_events.subscribe()
@@ -195,6 +206,61 @@ async def speech(data: SpeechRequest, db: Session = Depends(get_db)):
     if arguments is None:
         return FileResponse(path, media_type=media_type)
     return Response(content=await _transcode(str(path), arguments), media_type=media_type)
+
+
+# Formats for a stream: what `ffmpeg` can encode on the fly. `wav` is built in Python
+# (a header without a length + 16-bit samples at the engine's rate).
+STREAM_ARGUMENTS = {name: arguments for name, (_, arguments) in FORMATS.items() if arguments}
+
+
+async def _speech_streamed(profile, text: str, instruct, format_: str, stream_format: str, db: Session):
+    """The generation through the queue with `client_stream` — chunks as they are made.
+
+    A generation that cannot stream (panel normalization on, effects, text over the chunk
+    limit) gives no stream: then the whole file goes out at the end, in the same shape
+    (one SSE delta, or the plain body).
+    """
+    from fastapi.responses import StreamingResponse
+
+    from ..services import client_stream
+    from .generations import generate_speech
+
+    generation = await generate_speech(
+        models.GenerationRequest(
+            profile_id=profile.id,
+            text=text,
+            language=profile.language or "en",
+            engine=None,
+            instruct=instruct,
+            **_panel_settings(db),
+        ),
+        db,
+        source="openai",
+        client_stream=True,
+    )
+    media_type = FORMATS[format_][0]
+    stream = await client_stream.wait_decision(generation.id, db)
+
+    if stream is not None:
+        if format_ == "wav":
+            chunks = client_stream.wav(stream)
+        else:
+            chunks = client_stream.encoded(stream, STREAM_ARGUMENTS[format_])
+    else:
+        row = await client_stream.wait_end(generation.id, db)
+        if row.status == "failed":
+            raise HTTPException(status_code=500, detail=row.error or "The generation failed.")
+        path = config.resolve_storage_path(row.audio_path)
+        if not path or not path.exists():
+            raise HTTPException(status_code=500, detail="No audio file after the generation.")
+        arguments = FORMATS[format_][1]
+        body = path.read_bytes() if arguments is None else await _transcode(str(path), arguments)
+        chunks = client_stream.once(body)
+
+    if stream_format == "sse":
+        return StreamingResponse(client_stream.as_sse(chunks), media_type="text/event-stream",
+                                 headers=client_stream.HEADERS)
+    return StreamingResponse(chunks, media_type=media_type, headers=client_stream.HEADERS)
 
 
 @router.get("/voices")

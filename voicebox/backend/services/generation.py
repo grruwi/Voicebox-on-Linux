@@ -48,6 +48,7 @@ async def run_generation(
     crossfade_ms: Optional[int] = None,
     version_id: Optional[str] = None,
     preset_voice_id: Optional[str] = None,
+    client_stream: bool = False,
 ) -> None:
     """Execute TTS inference and persist the result.
 
@@ -121,10 +122,13 @@ async def run_generation(
             and not effects_chain
             and hasattr(tts_model, "generate_stream")
             and len(text) <= (max_chunk_chars or 800)
-            and not _source_is_openai(generation_id, bg_db)
+            and (client_stream or not _source_is_openai(generation_id, bg_db))
         )
+        # ⭐ `client_stream` (11.10, grruwi): the API client that asked wants the chunks
+        # itself (`stream: true` on /v1/audio/speech, /generate/stream, `?client_stream=true`
+        # on /generate) — they go to `browser_stream`, never to the speakers.
         twitch = streamable and _source_is_twitch(generation_id, bg_db)
-        to_speakers = streamable and (
+        to_speakers = streamable and not client_stream and (
             _source_is_agent(generation_id, bg_db)
             or twitch
             or not _frontend_plays_itself(bg_db)

@@ -58,8 +58,13 @@ async def generate_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),
     source: str = "manual",
+    client_stream: bool = False,
 ):
-    """Generate speech from text using a voice profile."""
+    """Generate speech from text using a voice profile.
+
+    `?client_stream=true` = the chunks go to `GET /generate/{id}/browser-stream` as they
+    are made (raw f32le, see services/client_stream.py), not to the speakers or the panel.
+    """
     task_manager = get_task_manager()
     generation_id = str(uuid.uuid4())
 
@@ -140,6 +145,7 @@ async def generate_speech(
             max_chunk_chars=data.max_chunk_chars,
             crossfade_ms=data.crossfade_ms,
             preset_voice_id=data.preset_voice_id,
+            client_stream=client_stream,
         )
     )
 
@@ -279,30 +285,14 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
 @router.get("/generate/{generation_id}/browser-stream")
 async def browser_stream_endpoint(generation_id: str, db: Session = Depends(get_db)):
     """4 bytes of sample rate (uint32 LE) + raw f32le mono, as it is computed."""
-    import time
-
     from fastapi import Response
-    from ..services import browser_stream
+    from ..services import client_stream
 
     # The generation may wait in the queue behind another — wait for `run_generation`'s decision.
-    deadline = time.monotonic() + 600
-    next_db_read = 0.0
-    while True:
-        decided, stream = browser_stream.get(generation_id)
-        if decided:
-            break
-        now = time.monotonic()
-        if now > deadline:
-            return Response(status_code=204)
-        if now >= next_db_read:
-            next_db_read = now + 0.25
-            db.expire_all()
-            status = db.query(DBGeneration.status).filter_by(id=generation_id).scalar()
-            if status is None and not db.query(DBGeneration.id).filter_by(id=generation_id).first():
-                raise HTTPException(status_code=404, detail="Generation not found")
-            if status in ("completed", "failed"):
-                return Response(status_code=204)
-        await asyncio.sleep(0.02)
+    try:
+        stream = await client_stream.wait_decision(generation_id, db)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Generation not found")
 
     if stream is None:
         return Response(status_code=204)
@@ -361,98 +351,38 @@ async def stream_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),
 ):
-    """Generate speech and stream the WAV audio directly without saving to disk."""
-    from ..backends import (
-        engine_needs_trim,
-        engine_retries_runaway,
-        ensure_model_cached_or_raise,
-        get_tts_backend_for_engine,
-        load_engine_model,
-    )
+    """Speech as a WAV stream — the sound goes out WHILE it is computed.
 
-    profile = await profiles.get_profile(data.profile_id, db)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    ⭐ 11.10 (grruwi): upstream generated the whole take first and only then cut the WAV
+    into 64 KB pieces — no earlier sound at all, and it went around the queue. Now it is
+    a queued generation like any other (`client_stream`, services/client_stream.py), it
+    lands in the history (source "openai"), and the WAV header carries no length.
+    Fields the client did not send (normalize, chunking, crossfade) come from the panel —
+    upstream's `normalize=True` default alone would switch streaming off.
+    A generation that cannot stream sends the whole file at the end instead.
+    """
+    from fastapi.responses import FileResponse
 
-    engine = _resolve_generation_engine(data, profile)
-    try:
-        profiles.validate_profile_engine(profile, engine)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    tts_model = get_tts_backend_for_engine(engine)
-    model_size = data.model_size or "1.7B"
+    from ..services import client_stream
+    from .openai_compat import _panel_settings
 
-    await ensure_model_cached_or_raise(engine, model_size)
-    await load_engine_model(engine, model_size)
+    panel = {k: v for k, v in _panel_settings(db).items() if k not in data.model_fields_set}
+    if panel:
+        data = data.model_copy(update=panel)
+    generation = await generate_speech(data, db, source="openai", client_stream=True)
+    headers = {**client_stream.HEADERS, "Content-Disposition": 'attachment; filename="speech.wav"'}
 
-    voice_prompt = await profiles.create_voice_prompt_for_profile(
-        data.profile_id,
-        db,
-        engine=engine,
-    )
+    stream = await client_stream.wait_decision(generation.id, db)
+    if stream is not None:
+        return StreamingResponse(client_stream.wav(stream), media_type="audio/wav", headers=headers)
 
-    from ..utils.chunked_tts import generate_chunked
-
-    trim_fn = None
-    runaway_detector = None
-    if engine_needs_trim(engine):
-        from ..utils.audio import trim_tts_output
-
-        trim_fn = trim_tts_output
-    if engine_retries_runaway(engine):
-        from ..utils.audio import has_tts_runaway
-
-        runaway_detector = has_tts_runaway
-
-    audio, sample_rate = await generate_chunked(
-        tts_model,
-        data.text,
-        voice_prompt,
-        language=data.language,
-        seed=data.seed,
-        instruct=data.instruct,
-        max_chunk_chars=data.max_chunk_chars,
-        crossfade_ms=data.crossfade_ms,
-        trim_fn=trim_fn,
-        runaway_detector=runaway_detector,
-    )
-
-    effects_chain_config = None
-    if data.effects_chain is not None:
-        effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    elif profile.effects_chain:
-        import json as _json
-
-        try:
-            effects_chain_config = _json.loads(profile.effects_chain)
-        except Exception:
-            effects_chain_config = None
-
-    if effects_chain_config:
-        from ..utils.effects import apply_effects
-
-        audio = apply_effects(audio, sample_rate, effects_chain_config)
-
-    if data.normalize:
-        from ..utils.audio import normalize_audio
-
-        audio = normalize_audio(audio)
-
-    wav_bytes = tts.audio_to_wav_bytes(audio, sample_rate)
-
-    async def _wav_stream():
-        try:
-            chunk_size = 64 * 1024
-            for i in range(0, len(wav_bytes), chunk_size):
-                yield wav_bytes[i : i + chunk_size]
-        except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
-            logger.debug("Client disconnected during audio stream")
-
-    return StreamingResponse(
-        _wav_stream(),
-        media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
-    )
+    row = await client_stream.wait_end(generation.id, db)
+    if row.status == "failed":
+        raise HTTPException(status_code=500, detail=row.error or "The generation failed.")
+    path = config.resolve_storage_path(row.audio_path)
+    if not path or not path.exists():
+        raise HTTPException(status_code=500, detail="No audio file after the generation.")
+    return FileResponse(path, media_type="audio/wav", headers=headers)
 
 
 @router.post("/generate/import", response_model=models.GenerationResponse)

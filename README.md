@@ -160,9 +160,19 @@ Base URL `http://<host>:17493/v1`, any API key (not checked).
 from the panel. `instructions`: a style for Vox (e.g. "whispering"), a voice description for
 OmniVoice (gender, age, pitch, accent).
 
+**Streaming:** `"stream": true` (or `"stream_format": "audio"`) sends the sound while it is
+computed — first bytes after ~0.2 s instead of after the whole take. Works with `pcm`, `wav`,
+`mp3`, `opus`, `aac`, `flac`. `"stream_format": "sse"` = OpenAI's `speech.audio.delta`
+events (base64 audio in `response_format`). Without either: the whole file at the end.
+
 ```bash
 curl http://<host>:17493/v1/audio/speech -H 'Content-Type: application/json' \
   -d '{"input": "Hi, this is Voicebox.", "voice": "my profile"}' -o speech.mp3
+
+# streamed straight into a player
+curl -sN http://<host>:17493/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"input": "Hi, this is Voicebox.", "voice": "my profile", "response_format": "wav", "stream": true}' \
+  | ffplay -nodisp -autoexit -probesize 32 -analyzeduration 0 -fflags nobuffer -i -
 ```
 
 **Open WebUI:** Admin panel → Settings → Audio → TTS and STT: engine *OpenAI*,
@@ -172,6 +182,16 @@ URL `http://<host>:17493/v1`, any key, voice = a profile name.
 
 What the panel uses: per-request engine, seed, effects, generation history, chunked streaming.
 Full list: `http://<host>:17493/docs`.
+
+Streaming here too:
+- `POST /generate/stream` — the same body as `/generate`, answers with a WAV that plays while
+  it is computed (the header carries no length);
+- `POST /generate?client_stream=true` → `GET /generate/{id}/browser-stream` — the raw stream:
+  4 bytes of sample rate (uint32 LE), then f32le mono.
+
+All streaming goes through the same queue as everything else and lands in the history. A
+generation that cannot stream (normalization, effects, text over the chunk limit) sends the
+whole file at the end instead.
 
 ### MCP
 
