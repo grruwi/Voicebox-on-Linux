@@ -72,6 +72,17 @@ def _cache_dir() -> str:
     return str(_SAMPLE_CACHE / tag)
 
 
+def _omni_cache_dir(path: Path) -> str:
+    """OmniVoice's sample cache (the same patch): the reference audio tokens, a directory
+    per weight file. Its own directory — Vox and OmniVoice encode a sample differently."""
+    try:
+        st = path.stat()
+        tag = f"{path.stem}-{st.st_size}-{int(st.st_mtime)}"
+    except OSError:
+        tag = path.stem
+    return str(_SAMPLE_CACHE / tag)
+
+
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -287,7 +298,10 @@ def _omni_entry(dtype: str, flash: bool, lazy: bool) -> dict:
         "mode": "streaming",
         "path": str(omni_weights(dtype)),
         "lazy": lazy,
-        "session_options": {"omnivoice.perf_mode": "flash_attention"} if flash else {},
+        "session_options": {
+            **({"omnivoice.perf_mode": "flash_attention"} if flash else {}),
+            "omnivoice.prompt_disk_cache_dir": _omni_cache_dir(omni_weights(dtype)),
+        },
     }
 
 

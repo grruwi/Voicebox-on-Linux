@@ -363,6 +363,19 @@ index 19c1223..62ceacc 100644
      void clear_on_backend();
      TransformerKVState export_state() const;
  
+diff --git a/include/engine/models/omnivoice/session.h b/include/engine/models/omnivoice/session.h
+index 97fc5c8..cfc2589 100644
+--- a/include/engine/models/omnivoice/session.h
++++ b/include/engine/models/omnivoice/session.h
+@@ -94,6 +94,8 @@ private:
+     OmniVoicePostprocessor postprocessor_;
+     SessionDefaults session_defaults_;
+     std::optional<ReferencePromptCacheEntry> reference_prompt_cache_;
++    // Voicebox: katalog cache próbki na dysku (`omnivoice.prompt_disk_cache_dir`); pusty = wyłączony.
++    std::string prompt_disk_cache_dir_;
+     std::optional<OmniVoiceRequest> stream_request_;
+     std::vector<std::string> stream_text_chunks_;
+     std::optional<OmniVoiceAudioTokens> stream_first_chunk_reference_;
 diff --git a/include/engine/models/voxcpm2/audiovae.h b/include/engine/models/voxcpm2/audiovae.h
 index e7dbdbb..0d493e0 100644
 --- a/include/engine/models/voxcpm2/audiovae.h
@@ -696,6 +709,90 @@ index 4ab7210..0b7f982 100644
          if (cache_steps_ > 0) {
              const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
              cache.import_key_scratch.resize(cache_elems);
+diff --git a/src/models/omnivoice/session.cpp b/src/models/omnivoice/session.cpp
+index 67acf2e..2c8d0fe 100644
+--- a/src/models/omnivoice/session.cpp
++++ b/src/models/omnivoice/session.cpp
+@@ -5,6 +5,9 @@
+ #include "engine/framework/runtime/spec_backed_model.h"
+ #include "engine/framework/text/chunking.h"
+ 
++// Voicebox: ten sam zapis na dysk co cache próbki Voxa.
++#include "../voxcpm2/prompt_disk_cache.h"
++
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
+@@ -255,6 +258,9 @@ OmniVoiceSession::OmniVoiceSession(
+           mem_saver_,
+           generator_perf_mode_) {
+     engine::debug::trace_log_scalar("omnivoice.perf_mode", perf_mode_name(generator_perf_mode_));
++    if (const auto dir = runtime::find_option(options.options, {"omnivoice.prompt_disk_cache_dir"})) {
++        prompt_disk_cache_dir_ = *dir;
++    }
+     if (task_.task != runtime::VoiceTaskKind::Tts) {
+         throw std::runtime_error("OmniVoice only supports VoiceTaskKind::Tts");
+     }
+@@ -710,7 +716,58 @@ OmniVoiceAudioTokens OmniVoiceSession::resolve_reference_audio_tokens(
+         entry.channels = audio.channels;
+         entry.sample_count = sample_count;
+         entry.sample_hash = sample_hash;
+-        entry.tokens = audio_tokenizer_.encode_reference_audio(audio, reference_options);
++        // Voicebox: RAM trzyma jeden profil i ginie z procesem — przed tokenizerem pytamy
++        // dysk. Tokeny zależą od próbek, obu flag i typu wag tokenizera; katalog (od
++        // wołającego) rozdziela pliki wag. Każdy błąd dysku = zwykły brak w cache.
++        namespace disk = engine::models::voxcpm2::prompt_disk_cache;
++        std::filesystem::path disk_file;
++        bool disk_hit = false;
++        if (!prompt_disk_cache_dir_.empty()) {
++            disk::Hasher hasher;
++            hasher.str("omnivoice.reference_tokens.v1");
++            hasher.i64(static_cast<int64_t>(audio_tokenizer_weight_storage_type_));
++            hasher.i64(preprocess_prompt ? 1 : 0);
++            hasher.i64(reference_text_provided ? 1 : 0);
++            hasher.audio(audio);
++            disk_file = std::filesystem::path(prompt_disk_cache_dir_) / (hasher.hex() + ".omni");
++            if (auto blob = disk::load(disk_file, 2, 2)) {
++                const auto & ids = blob->arrays[0];
++                const int64_t frames = blob->ints[0];
++                const int64_t codebooks = blob->ints[1];
++                if (frames > 0 && codebooks > 0 && blob->arrays[1].size() == 1 &&
++                    static_cast<int64_t>(ids.size()) == frames * codebooks) {
++                    entry.tokens.frames = frames;
++                    entry.tokens.codebooks = codebooks;
++                    entry.tokens.reference_rms = blob->arrays[1][0];
++                    entry.tokens.token_ids.assign(ids.begin(), ids.end());
++                    disk_hit = true;
++                }
++            }
++        }
++        if (!disk_hit) {
++            entry.tokens = audio_tokenizer_.encode_reference_audio(audio, reference_options);
++            // Id tokenów jako float: dokładne do 2^24 (kodeki mają ~1-4 tys. wpisów).
++            // Wynik z NaN/inf albo spoza zakresu nie trafia na dysk.
++            bool storable = !disk_file.empty() && std::isfinite(entry.tokens.reference_rms) &&
++                static_cast<int64_t>(entry.tokens.token_ids.size()) ==
++                    entry.tokens.frames * entry.tokens.codebooks;
++            std::vector<float> ids;
++            if (storable) {
++                ids.reserve(entry.tokens.token_ids.size());
++                for (const int32_t id : entry.tokens.token_ids) {
++                    if (id < -(1 << 24) || id > (1 << 24)) {
++                        storable = false;
++                        break;
++                    }
++                    ids.push_back(static_cast<float>(id));
++                }
++            }
++            if (storable) {
++                disk::save(disk_file, {{entry.tokens.frames, entry.tokens.codebooks},
++                                       {std::move(ids), {entry.tokens.reference_rms}}});
++            }
++        }
++        engine::debug::trace_log_scalar("omnivoice.prompt_cache.disk_hit", disk_hit ? 1 : 0);
+         reference_prompt_cache_ = std::move(entry);
+     }
+     return reference_prompt_cache_->tokens;
 diff --git a/src/models/voxcpm2/audiovae.cpp b/src/models/voxcpm2/audiovae.cpp
 index 2d890f5..93aacc6 100644
 --- a/src/models/voxcpm2/audiovae.cpp
