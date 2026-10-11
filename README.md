@@ -1,4 +1,4 @@
-# Voicebox on Linux with audio.cpp, ROCm and PyTorch to choose from.
+# Voicebox on Linux with audio.cpp, Vulkan, ROCm and PyTorch to choose from.
 
 [Voicebox](https://github.com/jamiepine/voicebox) (a voice-cloning panel, MIT) reworked so that
 speech comes from [audio.cpp](https://github.com/0xShug0/audio.cpp) (ggml, Vulkan or ROCm), speech
