@@ -12,6 +12,9 @@ Silniki mowy (oba klonują głos z próbki):
 - **OmniVoice** (k2-fsa): dyfuzja, generuje całą wypowiedź naraz, ~3× szybciej niż czas mowy;
   q8 albo f16, opcjonalny strumień kawałkami (po liniach albo zdaniach).
 
+Edytor próbki przy profilu (guzik „Edytuj” obok Whispera): zaznaczanie na fali, cięcie, pętla, A/B
+z oryginałem, Ctrl+Z/Y, filtry na żywo — de-esser, de-click, półka na górę, bramka (ffmpeg).
+
 Trzy kontenery:
 
 | kontener   | co robi                                                                 |

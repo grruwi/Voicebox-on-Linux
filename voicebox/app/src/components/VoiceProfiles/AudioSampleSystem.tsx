@@ -1,10 +1,11 @@
 import { Mic, Monitor, Pause, Play, Square } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
+import { type EdytorProps, PrzyciskEdytor } from './PrzyciskEdytor';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
 import { formatAudioDuration } from '@/lib/utils/audio';
 
-interface AudioSampleSystemProps {
+interface AudioSampleSystemProps extends EdytorProps {
   file: File | null | undefined;
   isRecording: boolean;
   duration: number;
@@ -28,6 +29,7 @@ export function AudioSampleSystem({
   onPlayPause,
   isPlaying,
   isTranscribing = false,
+  onEdit,
 }: AudioSampleSystemProps) {
   const { t } = useTranslation();
   return (
@@ -100,6 +102,7 @@ export function AudioSampleSystem({
                   <Mic className="h-4 w-4" />
                   {isTranscribing ? t('audioSample.transcribing') : t('audioSample.transcribe')}
                 </Button>
+                <PrzyciskEdytor onEdit={onEdit} />
                 <Button
                   type="button"
                   variant="outline"

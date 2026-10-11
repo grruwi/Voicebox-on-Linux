@@ -58,6 +58,7 @@ import { type ProfileFormDraft, useUIStore } from '@/stores/uiStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
+import { EdytorProbki } from './EdytorProbki';
 import { SampleList } from './SampleList';
 
 const MAX_AUDIO_DURATION_SECONDS = 30;
@@ -148,6 +149,7 @@ export function ProfileForm() {
   const [sampleMode, setSampleMode] = useState<'upload' | 'record' | 'system'>('record');
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
+  const [edytorOtwarty, setEdytorOtwarty] = useState(false);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [selectedPresetEngine, setSelectedPresetEngine] = useState<string>('kokoro');
   const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
@@ -983,6 +985,7 @@ export function ProfileForm() {
                                     isPlaying={isPlaying}
                                     isValidating={isValidatingAudio}
                                     isTranscribing={transcribe.isPending}
+                                    onEdit={() => setEdytorOtwarty(true)}
                                     isDisabled={
                                       audioDuration !== null &&
                                       audioDuration > MAX_AUDIO_DURATION_SECONDS
@@ -1009,6 +1012,7 @@ export function ProfileForm() {
                                     onPlayPause={handlePlayPause}
                                     isPlaying={isPlaying}
                                     isTranscribing={transcribe.isPending}
+                                    onEdit={() => setEdytorOtwarty(true)}
                                   />
                                 )}
                               />
@@ -1031,12 +1035,19 @@ export function ProfileForm() {
                                       onPlayPause={handlePlayPause}
                                       isPlaying={isPlaying}
                                       isTranscribing={transcribe.isPending}
+                                      onEdit={() => setEdytorOtwarty(true)}
                                     />
                                   )}
                                 />
                               </TabsContent>
                             )}
                           </Tabs>
+                          <EdytorProbki
+                            file={selectedFile}
+                            open={edytorOtwarty}
+                            onOpenChange={setEdytorOtwarty}
+                            onApply={(plik) => form.setValue('sampleFile', plik, { shouldValidate: true })}
+                          />
 
                           <FormField
                             control={form.control}

@@ -3,6 +3,7 @@ import { memo, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Visualizer } from 'react-sound-visualizer';
 import { Button } from '@/components/ui/button';
+import { type EdytorProps, PrzyciskEdytor } from './PrzyciskEdytor';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
 import { formatAudioDuration } from '@/lib/utils/audio';
 
@@ -22,7 +23,7 @@ const MemoizedWaveform = memo(function MemoizedWaveform({
   );
 });
 
-interface AudioSampleRecordingProps {
+interface AudioSampleRecordingProps extends EdytorProps {
   file: File | null | undefined;
   isRecording: boolean;
   duration: number;
@@ -47,6 +48,7 @@ export function AudioSampleRecording({
   onPlayPause,
   isPlaying,
   isTranscribing = false,
+  onEdit,
   showWaveform = true,
 }: AudioSampleRecordingProps) {
   const { t } = useTranslation();
@@ -154,6 +156,7 @@ export function AudioSampleRecording({
                   <Mic className="h-4 w-4" />
                   {isTranscribing ? t('audioSample.transcribing') : t('audioSample.transcribe')}
                 </Button>
+                <PrzyciskEdytor onEdit={onEdit} />
                 <Button
                   type="button"
                   variant="outline"

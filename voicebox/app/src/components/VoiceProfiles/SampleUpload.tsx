@@ -31,6 +31,7 @@ import { usePlatform } from '@/platform/PlatformContext';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
+import { EdytorProbki } from './EdytorProbki';
 
 const sampleSchema = z.object({
   file: z.instanceof(File, { message: 'Please select an audio file' }),
@@ -55,6 +56,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   const { data: profile } = useProfile(profileId);
   const { toast } = useToast();
   const [mode, setMode] = useState<'upload' | 'record' | 'system'>('upload');
+  const [edytorOtwarty, setEdytorOtwarty] = useState(false);
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
 
   const form = useForm<SampleFormValues>({
@@ -263,6 +265,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                       onPlayPause={handlePlayPause}
                       isPlaying={isPlaying}
                       isTranscribing={transcribe.isPending}
+                      onEdit={() => setEdytorOtwarty(true)}
                       fieldName={name}
                     />
                   )}
@@ -285,6 +288,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                       onPlayPause={handlePlayPause}
                       isPlaying={isPlaying}
                       isTranscribing={transcribe.isPending}
+                      onEdit={() => setEdytorOtwarty(true)}
                     />
                   )}
                 />
@@ -307,12 +311,19 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                         onPlayPause={handlePlayPause}
                         isPlaying={isPlaying}
                         isTranscribing={transcribe.isPending}
+                        onEdit={() => setEdytorOtwarty(true)}
                       />
                     )}
                   />
                 </TabsContent>
               )}
             </Tabs>
+            <EdytorProbki
+              file={selectedFile}
+              open={edytorOtwarty}
+              onOpenChange={setEdytorOtwarty}
+              onApply={(plik) => form.setValue('file', plik, { shouldValidate: true })}
+            />
 
             <FormField
               control={form.control}

@@ -434,6 +434,25 @@ class ApiClient {
     return response.json();
   }
 
+  /** Filtry edytora probki (ffmpeg: deesser, adeclick, treble, agate) → ten sam dzwiek po filtrach. */
+  async filtrujProbke(wav: Blob, ustawienia: unknown, sygnal?: AbortSignal): Promise<Blob> {
+    const formData = new FormData();
+    formData.append('file', wav, 'probka.wav');
+    formData.append('ustawienia', JSON.stringify(ustawienia));
+    const response = await fetch(`${this.getBaseUrl()}/edytor/filtry`, {
+      method: 'POST',
+      body: formData,
+      signal: sygnal,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        detail: response.statusText,
+      }));
+      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
+    }
+    return response.blob();
+  }
+
   // Captures
   async listCaptures(limit = 50, offset = 0): Promise<CaptureListResponse> {
     return this.request<CaptureListResponse>(
