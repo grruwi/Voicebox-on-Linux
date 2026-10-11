@@ -29,6 +29,9 @@ services:
       MIOPEN_CUSTOM_CACHE_DIR: /cache/miopen-cache
       TORCHINDUCTOR_CACHE_DIR: /cache/inductor
       TRITON_CACHE_DIR: /cache/triton
+      # The voice-sample cache (encoded profile samples). Without it the worker writes
+      # inside the container and a rebuild wipes it — every profile encodes again.
+      VOXCPM_PROMPT_CACHE: /cache/prompt-cache
       # TunableOp (matrix-multiply tuning) — OFF. Measured on an RX 9070 XT: generation
       # steps +8%, but every load +1.9 s (it starts rocBLAS and hipBLASLt at the first
       # matmul). To tune: ENABLED "1" + TUNING "1" for a few generations (every new shape
