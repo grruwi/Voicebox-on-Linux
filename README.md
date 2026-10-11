@@ -7,6 +7,10 @@ PyTorch engine on ROCm. Any card with Vulkan is enough for the default setup.
 
 An unofficial rework, not affiliated with the Voicebox or audio.cpp authors — report bugs here.
 
+**Prebuilt VoxCPM2 weights (our quants):** [huggingface.co/grruwi](https://huggingface.co/grruwi) —
+[for audio.cpp](https://huggingface.co/grruwi/VoxCPM2-audiocpp-prebuilt) ·
+[for PyTorch](https://huggingface.co/grruwi/VoxCPM2-pytorch-prebuilt)
+
 Voices (both clone from a sample):
 - **VoxCPM2**: streaming, first sound after ~0.2 s; weight precision (q8/f16/f32) picked in the panel;
 - **OmniVoice** (k2-fsa): diffusion, the whole utterance at once, ~3× faster than real time;
@@ -60,8 +64,8 @@ Vox and OmniVoice never sit on the card together (unless you turn the Offloader 
 ## Start
 
 ```bash
-git clone https://github.com/grruwi/voicebox-audiocpp.git
-cd voicebox-audiocpp
+git clone https://github.com/grruwi/Voicebox-on-Linux.git
+cd Voicebox-on-Linux
 ./download-models.sh            # minimum ~11 GB; `all` = every variant, `pytorch` = the PyTorch engine
 cp .env.example .env            # optional: an LLM server for transcript refine
 docker compose up -d --build    # the first build compiles audio.cpp and whisper.cpp
