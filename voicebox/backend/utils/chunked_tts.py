@@ -19,11 +19,10 @@ logger = logging.getLogger("voicebox.chunked-tts")
 
 # Default chunk size in characters.  Can be overridden per-request via
 # the ``max_chunk_chars`` field on GenerationRequest.
-# ⚠️ 15.08 OBNIZONE 800 -> 300. Upstream (usage guide, "Long text"):
-# "gradual speed-up or buzzing" na dlugim tekscie, a lekarstwem NIE sa
-# galki tylko ciecie na segmenty. grruwi zdiagnozowal to uchem jako
-# sprzezenie zwrotne — poglos z probki wraca w warunkowanie i narasta.
-# Moje wypowiedzi mialy 600-700 znakow, czyli szly JEDNYM strzalem.
+# ⚠️ LOWERED 800 -> 300. Upstream (usage guide, "Long text"): "gradual speed-up
+# or buzzing" on long text, and the cure is NOT the knobs but cutting into
+# segments. By ear it is a feedback loop — the sample's reverb comes back into
+# the conditioning and builds up. 600-700 character replies went out in ONE shot.
 DEFAULT_MAX_CHUNK_CHARS = 300
 MAX_RUNAWAY_RETRIES = 2
 MIN_RUNAWAY_RETRY_CHARS = 100

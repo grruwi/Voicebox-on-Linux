@@ -1,63 +1,81 @@
-# Voicebox + silnik mowy audio.cpp (VoxCPM2 / OmniVoice) + whisper.cpp — wszystko na Vulkanie.
+# Voicebox + the audio.cpp speech engine (VoxCPM2 / OmniVoice) + whisper.cpp — Vulkan.
 #
-#   ./pobierz-modele.sh          # raz: wagi do ./modele (~7 GB)
-#   docker compose up -d --build # pierwszy build kilka–kilkanaście min (kompilacja silnika i whispera)
+#   ./download-models.sh             # once: weights into ./models
+#   docker compose up -d --build     # the first build takes a while (engine + whisper compile)
 #
-# Panel: http://localhost:17493  — dane (profile glosow, baza, generacje) w ./dane/voicebox
+# Panel: http://localhost:17493 — data (voice profiles, database, generations) in ./data/voicebox
+# Optional layers (see the README):
+#   docker-compose.rocm.yml     audio.cpp also on ROCm (Radeons), switch in the panel
+#   docker-compose.pytorch.yml  the PyTorch engine (needs ROCm)
 
-name: voicebox-vulkan
+name: voicebox-audiocpp
 
 services:
   voicebox:
     build: ./voicebox
+    image: voicebox
+    container_name: voicebox
+    # No login in Voicebox — loopback only. Open it wider at your own risk.
     ports:
-      - "17493:17493"
+      - "127.0.0.1:17493:17493"
     volumes:
-      - ./dane/voicebox:/app/data
-      - ./modele:/modele:ro
-      # Glos z MCP (`voicebox_speak`) gra na glosnikach SERWERA przez PulseAudio/PipeWire.
-      # Odkomentuj na maszynie z dzwiekiem (1000 = UID twojego usera):
+      - ./data/voicebox:/app/data
+      - ./models:/models:ro
+      # Voice from MCP (`voicebox_speak`) plays on the SERVER's speakers through
+      # PulseAudio/PipeWire. Uncomment on a machine with sound (1000 = your UID):
       # - /run/user/1000/pulse/native:/run/pulse/native
-    environment:
-      # - PULSE_SERVER=unix:/run/pulse/native
-      # Refine transkrypcji przez LLM — dowolny serwer zgodny z OpenAI (LM Studio, Ollama…), w .env
-      - VOICEBOX_LLM_ENGINE=lmstudio_llm
-      - LMSTUDIO_BASE_URL=${LMSTUDIO_BASE_URL:-}
-      - LMSTUDIO_API_KEY=${LMSTUDIO_API_KEY:-}
+    # LMSTUDIO_BASE_URL / LMSTUDIO_API_KEY — transcript refine through any
+    # OpenAI-compatible LLM server (see .env.example). Without it, refine is off.
+    env_file:
+      - path: .env
+        required: false
+    # environment:
+    #   - PULSE_SERVER=unix:/run/pulse/native
     depends_on:
       - audiocpp
       - whisper
     restart: unless-stopped
 
-  # Silnik mowy. Voicebox wysyla zarzadcy (17495) JEDEN model naraz — Vox albo OmniVoice,
-  # zaladowanie jednego zdejmuje drugi. Sam silnik slucha na 17496.
+  # The speech engine. Voicebox sends its manager (17495) ONE model at a time — Vox or
+  # OmniVoice; loading one unloads the other. The engine itself listens on 17496.
   audiocpp:
     build:
       context: ./audiocpp
-      target: vulkan    # rocm = opcjonalny wariant, patrz docker-compose.rocm.yml
+      target: vulkan    # rocm = the optional variant, see docker-compose.rocm.yml
+    image: audiocpp-backend
+    container_name: audiocpp-backend
     devices:
       - /dev/dri:/dev/dri
     volumes:
-      - ./modele:/modele:ro
-      # probki glosow z profili Voiceboxa (tylko odczyt) + cache cech probek (zapis)
-      - ./dane/voicebox:/app/data:ro
-      - ./dane/voicebox/cache/audiocpp-probki:/app/data/cache/audiocpp-probki
-      - ./dane/audiocpp-cache:/cache
+      # rw only for make_weights.py (prebuilt weights); the engine itself just reads
+      - ./models:/models
+      # voice samples from Voicebox's profiles (read-only) + the sample feature cache —
+      # without it every profile change re-encodes its samples (~2.4 s instead of ~4 ms)
+      - ./data/voicebox:/app/data:ro
+      - ./data/voicebox/cache/audiocpp-samples:/app/data/cache/audiocpp-samples
+      # Mesa's shader cache — without it Vulkan recompiles its pipelines on every start
+      - ./data/audiocpp-cache:/cache
     init: true
     restart: unless-stopped
-    # ── NVIDIA (niesprawdzone): Vulkan dla NVIDII daje nvidia-container-toolkit z hosta.
-    # Zamiast `devices` wyzej (to samo w `whisper`):
+    # ── NVIDIA (untested): Vulkan for NVIDIA comes from nvidia-container-toolkit on the host.
+    # Instead of `devices` above (the same in `whisper`):
     # runtime: nvidia
     # environment:
     #   - NVIDIA_VISIBLE_DEVICES=all
     #   - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility
 
+  # Speech recognition in its OWN process: dictation keeps working while a voice speaks
+  # (inside Voicebox's process the two would queue behind each other). The model is
+  # still chosen in the Voicebox panel (Whisper tab).
   whisper:
     build: ./whisper
+    image: whisper
+    container_name: whisper
     devices:
       - /dev/dri:/dev/dri
     volumes:
-      - ./modele/whisper-cpp/wagi:/whisper/wagi:ro
-      - ./dane/whisper:/dane
+      - ./models/whisper-cpp/weights:/whisper/weights:ro
+      # the panel's selection mirror + Mesa's shader cache
+      - ./data/whisper:/data
     init: true
     restart: unless-stopped

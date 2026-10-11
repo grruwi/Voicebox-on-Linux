@@ -58,12 +58,7 @@ import {
 } from '@/components/ListPane';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
-import type {
-  CaptureListResponse,
-  CaptureResponse,
-  CaptureSource,
-  VoiceProfileResponse,
-} from '@/lib/api/types';
+import type { CaptureListResponse, CaptureResponse, CaptureSource, TtsEngine, VoiceProfileResponse } from '@/lib/api/types';
 import type { LanguageCode } from '@/lib/constants/languages';
 import { BOTTOM_SAFE_AREA_PADDING } from '@/lib/constants/ui';
 import { useCaptureRecordingSession } from '@/lib/hooks/useCaptureRecordingSession';
@@ -267,10 +262,7 @@ export function CapturesTab() {
       // Preset profiles (Kokoro etc.) reject the qwen default — honor the
       // profile's stored engine preference. Cloned profiles without an
       // override fall through to whatever the backend picks.
-      const engine = voice.default_engine as
-        | 'qwen' | 'qwen_custom_voice' | 'voxcpm' | 'omnivoice' | 'voxcpm_pt' | 'fish_s2' | 'fish_s2_pt' | 'fish_s1' | 'supertonic' | 'luxtts' | 'chatterbox'
-        | 'chatterbox_turbo' | 'tada' | 'kokoro'
-        | undefined;
+      const engine = (voice.default_engine ?? undefined) as TtsEngine | undefined;
       return apiClient.generateSpeech({
         profile_id: voice.id,
         text,

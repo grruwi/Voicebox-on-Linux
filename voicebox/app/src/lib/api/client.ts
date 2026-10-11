@@ -47,11 +47,12 @@ import type {
   CaptureSettingsUpdate,
   CaptureSource,
   GenerationSettings,
-  StanKarty,
   GenerationSettingsUpdate,
-  TtsStan,
-  WhisperStan,
-  VoxWariant,
+  GpuState,
+  TtsState,
+  WhisperState,
+  VoxAcoustic,
+  VoxBaseLm,
   MCPClientBinding,
   MCPClientBindingListResponse,
   MCPClientBindingUpsert,
@@ -389,9 +390,9 @@ class ApiClient {
     return `${this.getBaseUrl()}/generate/${generationId}/status`;
   }
 
-  // Strumien mowy do przegladarki (autoplay zaznaczony) — lib/utils/strumienMowy.ts
+  // Speech streamed to the browser (autoplay on) — lib/utils/speechStream.ts
   getGenerationStreamUrl(generationId: string): string {
-    return `${this.getBaseUrl()}/generate/${generationId}/strumien`;
+    return `${this.getBaseUrl()}/generate/${generationId}/browser-stream`;
   }
 
   // Audio
@@ -434,15 +435,15 @@ class ApiClient {
     return response.json();
   }
 
-  /** Filtry edytora probki (ffmpeg: deesser, adeclick, treble, agate) → ten sam dzwiek po filtrach. */
-  async filtrujProbke(wav: Blob, ustawienia: unknown, sygnal?: AbortSignal): Promise<Blob> {
+  /** Sample editor filters (ffmpeg: deesser, adeclick, treble, agate) → the same sound, filtered. */
+  async filterSample(wav: Blob, settings: unknown, signal?: AbortSignal): Promise<Blob> {
     const formData = new FormData();
-    formData.append('file', wav, 'probka.wav');
-    formData.append('ustawienia', JSON.stringify(ustawienia));
-    const response = await fetch(`${this.getBaseUrl()}/edytor/filtry`, {
+    formData.append('file', wav, 'sample.wav');
+    formData.append('settings', JSON.stringify(settings));
+    const response = await fetch(`${this.getBaseUrl()}/editor/filters`, {
       method: 'POST',
       body: formData,
-      signal: sygnal,
+      signal,
     });
     if (!response.ok) {
       const error = await response.json().catch(() => ({
@@ -539,14 +540,14 @@ class ApiClient {
     return this.request<GenerationSettings>('/settings/generation');
   }
 
-  async getKarta(): Promise<StanKarty> {
-    return this.request<StanKarty>('/settings/karta');
+  async getGpu(): Promise<GpuState> {
+    return this.request<GpuState>('/settings/gpu');
   }
 
-  async setKarta(indeks: number | null): Promise<StanKarty> {
-    return this.request<StanKarty>('/settings/karta', {
+  async setGpu(index: number | null): Promise<GpuState> {
+    return this.request<GpuState>('/settings/gpu', {
       method: 'PUT',
-      body: JSON.stringify({ indeks }),
+      body: JSON.stringify({ index }),
     });
   }
 
@@ -559,38 +560,38 @@ class ApiClient {
     });
   }
 
-  async getWhisperStan(): Promise<WhisperStan> {
-    return this.request<WhisperStan>('/settings/generation/whisper-stan');
+  async getWhisperState(): Promise<WhisperState> {
+    return this.request<WhisperState>('/settings/generation/whisper-state');
   }
 
-  /** Podnosi `whisper-server` z wyborem z panelu. Wraca, gdy nasłuchuje. */
-  async zaladujWhisper(): Promise<WhisperStan> {
-    return this.request<WhisperStan>('/settings/generation/whisper-zaladuj', { method: 'POST' });
+  /** Loads whisper in its container with the panel's choice. Returns once it listens. */
+  async loadWhisper(): Promise<WhisperState> {
+    return this.request<WhisperState>('/settings/generation/whisper-load', { method: 'POST' });
   }
 
-  async rozladujWhisper(): Promise<WhisperStan> {
-    return this.request<WhisperStan>('/settings/generation/whisper-rozladuj', { method: 'POST' });
+  async unloadWhisper(): Promise<WhisperState> {
+    return this.request<WhisperState>('/settings/generation/whisper-unload', { method: 'POST' });
   }
 
-  /** Restart silnika z OmniVoice z panelu (wagi, flash attention, backend) — Vox schodzi. */
-  async reloadOmni(): Promise<TtsStan> {
-    return this.request<TtsStan>('/settings/generation/omni-reload', { method: 'POST' });
+  /** Restarts the engine with OmniVoice from the panel (weights, flash attention, backend) — Vox goes. */
+  async reloadOmni(): Promise<TtsState> {
+    return this.request<TtsState>('/settings/generation/omni-reload', { method: 'POST' });
   }
 
-  async rozladujOmni(): Promise<TtsStan> {
-    return this.request<TtsStan>('/settings/generation/omni-rozladuj', { method: 'POST' });
+  async unloadOmni(): Promise<TtsState> {
+    return this.request<TtsState>('/settings/generation/omni-unload', { method: 'POST' });
   }
 
-  async getTtsStan(): Promise<TtsStan> {
-    return this.request<TtsStan>('/settings/generation/tts-stan');
+  async getTtsState(): Promise<TtsState> {
+    return this.request<TtsState>('/settings/generation/tts-state');
   }
 
-  /** Ubija `llama-tts-server` i podnosi go z wybranymi wagami. Wraca dopiero,
-   *  gdy nowy zaczyna nasłuchiwać — f16 potrafi zająć ~10 s. */
-  async reloadTts(wariant?: VoxWariant | null, akustyka?: string | null): Promise<TtsStan> {
-    return this.request<TtsStan>('/settings/generation/tts-reload', {
+  /** Reloads Vox with the chosen weights (on whichever engine runs it). Returns only
+   *  once the new one listens — f16 can take ~10 s, PyTorch longer. */
+  async reloadTts(baseLm?: VoxBaseLm | null, acoustic?: VoxAcoustic | null): Promise<TtsState> {
+    return this.request<TtsState>('/settings/generation/tts-reload', {
       method: 'POST',
-      body: JSON.stringify({ wariant: wariant ?? null, akustyka: akustyka ?? null }),
+      body: JSON.stringify({ base_lm: baseLm ?? null, acoustic: acoustic ?? null }),
     });
   }
 
@@ -658,7 +659,7 @@ class ApiClient {
     });
   }
 
-  /** Ładowanie z ekranu modeli — backend przyjmuje tylko whispera. */
+  /** Loading from the models screen — whisper or a TTS engine. */
   async loadModel(modelName: string): Promise<{ message: string }> {
     return this.request<{ message: string }>(`/models/${modelName}/load`, {
       method: 'POST',

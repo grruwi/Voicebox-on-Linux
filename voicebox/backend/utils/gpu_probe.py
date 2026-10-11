@@ -1,17 +1,17 @@
-"""Co widac o karcie BEZ ladowania torcha.
+"""What can be seen about the card WITHOUT loading torch.
 
-Zdrowie i panel GPU sa odpytywane co kilka sekund. Gdyby siegaly po
-``torch.cuda``, pierwszy poll wciagnalby caly stos PyTorch do procesu — czyli
-dokladnie to, czego ma nie byc, dopoki nie zalado wany jest zaden model.
+Health and the GPU panel are polled every few seconds. If they reached for
+``torch.cuda``, the first poll would pull the whole PyTorch stack into the process —
+exactly what must not happen: Voicebox runs no model of its own.
 
-Wiec: **jesli torch juz siedzi w procesie, liczymy nim** (pelna wiernosc,
-CUDA/MPS/XPU tez); jesli nie — bierzemy to, co kernel wystawia w sysfs i
-`rocminfo`, i to wystarcza na nazwe karty oraz zajetosc VRAM.
+So: **if torch already sits in the process, we use it** (full fidelity, CUDA/MPS/XPU
+too); if not — we take what the kernel exposes in sysfs and `rocminfo`, which is
+enough for the card name and VRAM usage.
 
-⚠️ Roznica w znaczeniu liczby VRAM: ``torch.cuda.memory_allocated()`` mowi
-tylko o alokacjach torcha, a ``mem_info_vram_used`` o CALEJ karcie (pulpit,
-przegladarka, ggml, wszystko). Dlatego przy nieobecnym torchu wracamy z
-liczba sysfs i oznaczamy ja jako calosc karty.
+⚠️ The VRAM number means something different: ``torch.cuda.memory_allocated()`` only
+covers torch's allocations, while ``mem_info_vram_used`` covers the WHOLE card (desktop,
+browser, ggml, everything). So without torch we return the sysfs number and mark it as
+the whole card.
 """
 
 import os
@@ -22,19 +22,19 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple
 
-KATALOG_DRM = Path("/sys/class/drm")
+DRM_DIR = Path("/sys/class/drm")
 
 
-def torch_zaladowany() -> bool:
-    """Czy torch siedzi juz w procesie. Nie importuje go."""
+def torch_loaded() -> bool:
+    """Whether torch already sits in the process. Does not import it."""
     return "torch" in sys.modules
 
 
 @lru_cache(maxsize=1)
-def _karta_amdgpu() -> Optional[Path]:
-    """Katalog `device` pierwszej karty na sterowniku amdgpu."""
+def _amdgpu_card() -> Optional[Path]:
+    """The `device` directory of the first card on the amdgpu driver."""
     try:
-        uevents = sorted(KATALOG_DRM.glob("card*/device/uevent"))
+        uevents = sorted(DRM_DIR.glob("card*/device/uevent"))
     except OSError:
         return None
     for uevent in uevents:
@@ -47,62 +47,52 @@ def _karta_amdgpu() -> Optional[Path]:
 
 
 def vram_sysfs_mb() -> Optional[Tuple[float, float]]:
-    """(uzyte, calkowite) w MB dla calej karty. None, gdy kernel nie wystawia."""
-    karta = _karta_amdgpu()
-    if karta is None:
+    """(used, total) in MB for the whole card. None when the kernel does not expose it."""
+    card = _amdgpu_card()
+    if card is None:
         return None
     try:
-        uzyte = int((karta / "mem_info_vram_used").read_text().strip())
-        calosc = int((karta / "mem_info_vram_total").read_text().strip())
+        used = int((card / "mem_info_vram_used").read_text().strip())
+        total = int((card / "mem_info_vram_total").read_text().strip())
     except (OSError, ValueError):
         return None
-    return uzyte / 1024 / 1024, calosc / 1024 / 1024
+    return used / 1024 / 1024, total / 1024 / 1024
 
 
 @lru_cache(maxsize=1)
-def nazwa_gpu() -> Optional[str]:
-    """Nazwa handlowa karty z `rocminfo` (~20 ms, liczona raz na proces).
+def gpu_name() -> Optional[str]:
+    """The card's marketing name from `rocminfo` (~20 ms, computed once per process).
 
-    rocminfo wypisuje agenta CPU przed GPU i oba maja `Marketing Name`, wiec
-    nazwe bierzemy dopiero po linii `Device Type: GPU`.
+    rocminfo prints the CPU agent before the GPU and both have a `Marketing Name`, so
+    the name is taken only after the `Device Type: GPU` line.
 
-    ⚠️ `*_VISIBLE_DEVICES` ze srodowiska Voiceboxa sa tu ZDEJMOWANE. Pytamy o
-    zelazo, nie o to, co dany silnik ma widziec — a przy jednej karcie
-    `ROCR_VISIBLE_DEVICES=1` chowa ja calkowicie i panel zostalby bez nazwy.
+    ⚠️ `*_VISIBLE_DEVICES` from Voicebox's environment are REMOVED here. We ask about the
+    hardware, not about what an engine should see — with one card
+    `ROCR_VISIBLE_DEVICES=1` hides it completely and the panel would have no name.
     """
-    srodowisko = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.endswith("_VISIBLE_DEVICES")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.endswith("_VISIBLE_DEVICES")}
     try:
-        wynik = subprocess.run(
-            ["rocminfo"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=srodowisko,
-        )
+        result = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=5, env=env)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
-    if wynik.returncode != 0:
+    if result.returncode != 0:
         return None
 
-    nazwa = None
-    for linia in wynik.stdout.splitlines():
-        trafienie = re.search(r"Marketing Name:\s*(.+)", linia)
-        if trafienie:
-            nazwa = trafienie.group(1).strip()
-        elif re.search(r"Device\s+Type:\s*GPU", linia) and nazwa:
-            return nazwa
+    name = None
+    for line in result.stdout.splitlines():
+        hit = re.search(r"Marketing Name:\s*(.+)", line)
+        if hit:
+            name = hit.group(1).strip()
+        elif re.search(r"Device\s+Type:\s*GPU", line) and name:
+            return name
     return None
 
 
-def etykieta_bez_torcha() -> Optional[str]:
-    """Opis karty na panel, gdy torcha nie ma w procesie."""
-    nazwa = nazwa_gpu()
-    if nazwa:
-        return f"ROCm ({nazwa})"
-    if _karta_amdgpu() is not None:
+def label_without_torch() -> Optional[str]:
+    """The card description for the panel when torch is not in the process."""
+    name = gpu_name()
+    if name:
+        return f"ROCm ({name})"
+    if _amdgpu_card() is not None:
         return "AMD GPU"
     return None

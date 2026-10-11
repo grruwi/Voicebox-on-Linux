@@ -15,15 +15,18 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toggle } from '@/components/ui/toggle';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
-import type { OmniWagi, VoxAkustyka, VoxBackend, VoxWariant } from '@/lib/api/types';
-
-const NAZWA_BACKENDU: Record<VoxBackend, string> = { hip: 'ROCm (HIP)', vulkan: 'Vulkan (RADV)' };
+import type { OmniWeights, VoxAcoustic, VoxBackend, VoxBaseLm } from '@/lib/api/types';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
+import { GpuPicker } from './GpuPicker';
 import { SettingRow, SettingSection } from './SettingRow';
-import { WhisperUstawienia } from './WhisperUstawienia';
-import { WyborKartyGpu } from './WyborKartyGpu';
+import { WhisperSettings } from './WhisperSettings';
+
+const BACKEND_NAMES: Record<VoxBackend, string> = { hip: 'ROCm (HIP)', vulkan: 'Vulkan (RADV)' };
+
+const TABS = ['general', 'vox', 'omni', 'whisper'] as const;
+const TAB_KEY = 'generation-settings-tab';
 
 export function GenerationPage() {
   const { t } = useTranslation();
@@ -41,10 +44,9 @@ export function GenerationPage() {
   const [crossfadeMs, setCrossfadeMs] = useState(persistedCrossfadeMs);
   useEffect(() => setMaxChunkChars(persistedMaxChunkChars), [persistedMaxChunkChars]);
   useEffect(() => setCrossfadeMs(persistedCrossfadeMs), [persistedCrossfadeMs]);
-  // Pokretla VoxCPM2 (16.08). Byly w kodzie i w `ustawienia.env`, czyli kazda
-  // zmiana wymagala restartu backendu. Teraz ida z baza — dzialaja od nastepnej
-  // generacji. Suwak zapisuje sie na PUSZCZENIU (`onValueCommit`), nie w trakcie
-  // ciagniecia, bo inaczej leci PATCH na kazdy piksel.
+  // VoxCPM2 knobs live in the database — they take effect from the next generation,
+  // no backend restart. A slider saves on RELEASE (`onValueCommit`), not while
+  // dragging, otherwise a PATCH goes out for every pixel.
   const persistedVoxCfg = settings?.vox_cfg ?? 2.0;
   const persistedVoxTimesteps = settings?.vox_timesteps ?? 10;
   const persistedVoxTemperature = settings?.vox_temperature ?? 1.0;
@@ -54,9 +56,9 @@ export function GenerationPage() {
   useEffect(() => setVoxCfg(persistedVoxCfg), [persistedVoxCfg]);
   useEffect(() => setVoxTimesteps(persistedVoxTimesteps), [persistedVoxTimesteps]);
   useEffect(() => setVoxTemperature(persistedVoxTemperature), [persistedVoxTemperature]);
-  // Ziarno trzymamy jako TEKST, nie liczbę — puste pole musi być odróżnialne od
-  // zera, a `<input type="number">` zwraca pusty string i dla jednego, i dla
-  // drugiego. Zapis na wyjściu z pola (blur / Enter), nie na każdym klawiszu.
+  // The seed is kept as TEXT, not a number — an empty field has to be distinguishable
+  // from zero, and `<input type="number">` returns an empty string for both. Saved
+  // when leaving the field (blur / Enter), not on every key.
   const persistedVoxSeed = settings?.vox_seed ?? null;
   const [voxSeed, setVoxSeed] = useState(
     persistedVoxSeed === null ? '' : String(persistedVoxSeed),
@@ -65,155 +67,153 @@ export function GenerationPage() {
     setVoxSeed(persistedVoxSeed === null ? '' : String(persistedVoxSeed));
   }, [persistedVoxSeed]);
 
-  const zapiszSeed = useCallback(() => {
-    const tekst = voxSeed.trim();
-    // Puste = `null` = ziarno losowe przy każdej generacji. `null` przechodzi
-    // przez API i CZYŚCI kolumnę — bez tego nie dałoby się wrócić do losowego.
-    const wartosc = tekst === '' ? null : Number.parseInt(tekst, 10);
-    if (wartosc === persistedVoxSeed) return;
-    update({ vox_seed: wartosc });
+  const saveSeed = useCallback(() => {
+    const text = voxSeed.trim();
+    // Empty = `null` = a random seed on every generation. `null` goes through the API
+    // and CLEARS the column — otherwise there would be no way back to random.
+    const value = text === '' ? null : Number.parseInt(text, 10);
+    if (value === persistedVoxSeed) return;
+    update({ vox_seed: value });
   }, [voxSeed, persistedVoxSeed, update]);
   const [opening, setOpening] = useState(false);
   const [generationsPath, setGenerationsPath] = useState<string | null>(null);
-  // Wagi VoxCPM2 (21.08). Wariant wybiera sie przy STARCIE `llama-tts-server`,
-  // wiec do teraz zmiana quantu kosztowala restart calego Voicebota. To NIE idzie
-  // do bazy: `wybrany` to zyczenie, `zaladowany` to stan procesu czytany z /proc.
-  // Trwalosc po restarcie dalej daje `ustawienia.env`.
   const { toast } = useToast();
-  // ⭐ Wybór idzie DO BAZY (`vox_base_lm` / `vox_akustyka`), więc przeżywa
-  // restart i czytają go obie drogi do serwera. `zaladowany_*` to stan procesu
-  // z /proc — rozjeżdża się z wyborem do chwili przeładowania i to ma być widać.
-  const wybranyWariant = (settings?.vox_base_lm ?? 'q8') as VoxWariant;
-  const wybranaAkustyka = (settings?.vox_akustyka ?? 'f16') as VoxAkustyka;
-  const wybranyBackend = (settings?.vox_backend ?? 'vulkan') as VoxBackend;
-  const [zaladowanyWariant, setZaladowanyWariant] = useState<VoxWariant | null>(null);
-  const [zaladowanaAkustyka, setZaladowanaAkustyka] = useState<VoxAkustyka | null>(null);
-  const [zaladowanyBackend, setZaladowanyBackend] = useState<VoxBackend | null>(null);
-  const wybranyOmni = (settings?.omni_wagi ?? 'q8') as OmniWagi;
-  const [zaladowanyOmni, setZaladowanyOmni] = useState<OmniWagi | null>(null);
-  const [zaladowanyOmniFlash, setZaladowanyOmniFlash] = useState<boolean | null>(null);
-  // Suwaki OmniVoice: puste w bazie = default upstreamu (2,0 / 32) — tyle pokazujemy.
+  // ⭐ The choice goes INTO THE DATABASE (`vox_base_lm` / `vox_acoustic`), so it survives
+  // a restart and every road to the engine reads it. `loaded*` = what the engine really
+  // holds — it differs from the choice until a reload, and that has to be visible.
+  const selectedBaseLm = (settings?.vox_base_lm ?? 'q8') as VoxBaseLm;
+  const selectedAcoustic = (settings?.vox_acoustic ?? 'f16') as VoxAcoustic;
+  const selectedBackend = (settings?.vox_backend ?? 'vulkan') as VoxBackend;
+  const [loadedBaseLm, setLoadedBaseLm] = useState<VoxBaseLm | null>(null);
+  const [loadedAcoustic, setLoadedAcoustic] = useState<VoxAcoustic | null>(null);
+  const [loadedBackend, setLoadedBackend] = useState<VoxBackend | null>(null);
+  const selectedOmni = (settings?.omni_weights ?? 'q8') as OmniWeights;
+  const [loadedOmni, setLoadedOmni] = useState<OmniWeights | null>(null);
+  const [loadedOmniFlash, setLoadedOmniFlash] = useState<boolean | null>(null);
+  // OmniVoice sliders: empty in the database = upstream's default (2.0 / 32) — that is what we show.
   const persistedOmniCfg = settings?.omni_cfg ?? 2.0;
-  const persistedOmniKroki = settings?.omni_kroki ?? 32;
+  const persistedOmniSteps = settings?.omni_steps ?? 32;
   const [omniCfg, setOmniCfg] = useState(persistedOmniCfg);
-  const [omniKroki, setOmniKroki] = useState(persistedOmniKroki);
+  const [omniSteps, setOmniSteps] = useState(persistedOmniSteps);
   useEffect(() => setOmniCfg(persistedOmniCfg), [persistedOmniCfg]);
-  useEffect(() => setOmniKroki(persistedOmniKroki), [persistedOmniKroki]);
-  const persistedOmniTempo = settings?.omni_tempo ?? 1.0;
-  const [omniTempo, setOmniTempo] = useState(persistedOmniTempo);
-  useEffect(() => setOmniTempo(persistedOmniTempo), [persistedOmniTempo]);
-  const omniChunkTryb = settings?.omni_chunk_tryb ?? 'brak';
-  const persistedOmniChunkZnaki = settings?.omni_chunk_znaki ?? 160;
-  const [omniChunkZnaki, setOmniChunkZnaki] = useState(persistedOmniChunkZnaki);
-  useEffect(() => setOmniChunkZnaki(persistedOmniChunkZnaki), [persistedOmniChunkZnaki]);
+  useEffect(() => setOmniSteps(persistedOmniSteps), [persistedOmniSteps]);
+  const persistedOmniSpeed = settings?.omni_speed ?? 1.0;
+  const [omniSpeed, setOmniSpeed] = useState(persistedOmniSpeed);
+  useEffect(() => setOmniSpeed(persistedOmniSpeed), [persistedOmniSpeed]);
+  const omniChunkMode = settings?.omni_chunk_mode ?? 'none';
+  const persistedOmniChunkChars = settings?.omni_chunk_chars ?? 160;
+  const [omniChunkChars, setOmniChunkChars] = useState(persistedOmniChunkChars);
+  useEffect(() => setOmniChunkChars(persistedOmniChunkChars), [persistedOmniChunkChars]);
   const persistedOmniSeed = settings?.omni_seed ?? null;
   const [omniSeed, setOmniSeed] = useState(persistedOmniSeed === null ? '' : String(persistedOmniSeed));
   useEffect(() => {
     setOmniSeed(persistedOmniSeed === null ? '' : String(persistedOmniSeed));
   }, [persistedOmniSeed]);
-  const zapiszOmniSeed = useCallback(() => {
-    const tekst = omniSeed.trim();
-    const wartosc = tekst === '' ? null : Number.parseInt(tekst, 10);
-    if (wartosc === persistedOmniSeed) return;
-    update({ omni_seed: wartosc });
+  const saveOmniSeed = useCallback(() => {
+    const text = omniSeed.trim();
+    const value = text === '' ? null : Number.parseInt(text, 10);
+    if (value === persistedOmniSeed) return;
+    update({ omni_seed: value });
   }, [omniSeed, persistedOmniSeed, update]);
-  const [omniPracuje, setOmniPracuje] = useState(false);
-  const omniFlashWybrany = settings?.omni_flash ?? true;
-  const omniRozjazd =
-    zaladowanyOmni !== null &&
-    (zaladowanyOmni !== wybranyOmni || (zaladowanyOmniFlash ?? true) !== omniFlashWybrany);
-  const przeladujOmni = useCallback(async () => {
-    setOmniPracuje(true);
+  const [omniBusy, setOmniBusy] = useState(false);
+  const selectedOmniFlash = settings?.omni_flash ?? true;
+  const omniMismatch =
+    loadedOmni !== null &&
+    (loadedOmni !== selectedOmni || (loadedOmniFlash ?? true) !== selectedOmniFlash);
+  const reloadOmni = useCallback(async () => {
+    setOmniBusy(true);
     try {
       const s = await apiClient.reloadOmni();
-      setZaladowanyOmni(s.zaladowany_omni ?? null);
-      setZaladowanyOmniFlash(s.zaladowany_omni_flash ?? null);
-      setZaladowanyWariant(s.zaladowany_base_lm ?? null);
-      setZaladowanaAkustyka(s.zaladowany_akustyka ?? null);
+      setLoadedOmni(s.loaded_omni ?? null);
+      setLoadedOmniFlash(s.loaded_omni_flash ?? null);
+      setLoadedBaseLm(s.loaded_base_lm ?? null);
+      setLoadedAcoustic(s.loaded_acoustic ?? null);
       toast({
-        title: `OmniVoice przeładowany — ${s.zaladowany_omni ?? '?'}${s.zaladowany_omni_flash ? ' + flash attention' : ''}`,
-        description: s.ms ? `Wstał w ${(s.ms / 1000).toFixed(1)} s. Vox zszedł z karty.` : undefined,
+        title: `OmniVoice reloaded — ${s.loaded_omni ?? '?'}${s.loaded_omni_flash ? ' + flash attention' : ''}`,
+        description: s.ms ? `Up in ${(s.ms / 1000).toFixed(1)} s. Vox left the card.` : undefined,
       });
     } catch (e) {
       toast({
-        title: 'Nie udało się przeładować OmniVoice',
+        title: 'Could not reload OmniVoice',
         description: e instanceof Error ? e.message : String(e),
         variant: 'destructive',
       });
     } finally {
-      setOmniPracuje(false);
+      setOmniBusy(false);
     }
   }, [toast]);
-  const rozladujOmni = useCallback(async () => {
-    setOmniPracuje(true);
+  const unloadOmni = useCallback(async () => {
+    setOmniBusy(true);
     try {
-      const s = await apiClient.rozladujOmni();
-      setZaladowanyOmni(s.zaladowany_omni ?? null);
-      setZaladowanyOmniFlash(s.zaladowany_omni_flash ?? null);
+      const s = await apiClient.unloadOmni();
+      setLoadedOmni(s.loaded_omni ?? null);
+      setLoadedOmniFlash(s.loaded_omni_flash ?? null);
     } catch (e) {
       toast({
-        title: 'Nie udało się rozładować OmniVoice',
+        title: 'Could not unload OmniVoice',
         description: e instanceof Error ? e.message : String(e),
         variant: 'destructive',
       });
     } finally {
-      setOmniPracuje(false);
+      setOmniBusy(false);
     }
   }, [toast]);
-  // Ostatnio otwarta zakladka przezywa odswiezenie strony.
-  const [zakladka, setZakladka] = useState(() => localStorage.getItem('ustawienia-generacji-zakladka') ?? 'ogolne');
-  const zmienZakladke = useCallback((v: string) => {
-    setZakladka(v);
-    localStorage.setItem('ustawienia-generacji-zakladka', v);
+  // The last opened tab survives a page refresh.
+  const [tab, setTab] = useState(() => {
+    const saved = localStorage.getItem(TAB_KEY);
+    return saved && (TABS as readonly string[]).includes(saved) ? saved : 'general';
+  });
+  const changeTab = useCallback((v: string) => {
+    setTab(v);
+    localStorage.setItem(TAB_KEY, v);
   }, []);
-  const [ttsDostepny, setTtsDostepny] = useState(true);
-  const [przeladowuje, setPrzeladowuje] = useState(false);
-  const doPrzeladowania =
-    (zaladowanyWariant !== null && wybranyWariant !== zaladowanyWariant) ||
-    (zaladowanaAkustyka !== null && wybranaAkustyka !== zaladowanaAkustyka) ||
-    (zaladowanyBackend !== null && wybranyBackend !== zaladowanyBackend);
+  const [ttsAvailable, setTtsAvailable] = useState(true);
+  const [reloading, setReloading] = useState(false);
+  const needsReload =
+    (loadedBaseLm !== null && selectedBaseLm !== loadedBaseLm) ||
+    (loadedAcoustic !== null && selectedAcoustic !== loadedAcoustic) ||
+    (loadedBackend !== null && selectedBackend !== loadedBackend);
 
   useEffect(() => {
     apiClient
-      .getTtsStan()
+      .getTtsState()
       .then((s) => {
-        setTtsDostepny(s.dostepny);
-        setZaladowanyWariant(s.zaladowany_base_lm ?? s.wariant ?? null);
-        setZaladowanaAkustyka(s.zaladowany_akustyka ?? null);
-        setZaladowanyBackend(s.zaladowany_backend ?? null);
-        setZaladowanyOmni(s.zaladowany_omni ?? null);
-      setZaladowanyOmniFlash(s.zaladowany_omni_flash ?? null);
-        setZaladowanyOmniFlash(s.zaladowany_omni_flash ?? null);
+        setTtsAvailable(s.available);
+        setLoadedBaseLm(s.loaded_base_lm ?? null);
+        setLoadedAcoustic(s.loaded_acoustic ?? null);
+        setLoadedBackend(s.loaded_backend ?? null);
+        setLoadedOmni(s.loaded_omni ?? null);
+        setLoadedOmniFlash(s.loaded_omni_flash ?? null);
       })
       .catch(() => {});
   }, []);
 
-  const przeladujModel = useCallback(async () => {
-    setPrzeladowuje(true);
+  const reloadModel = useCallback(async () => {
+    setReloading(true);
     try {
-      // ⛔ BEZ ARGUMENTOW. Serwer bierze wybor z BAZY (`tts_serwer.wybrane()`),
-      // czyli z tego samego miejsca, ktore panel wlasnie zapisal. Podawanie
-      // wartosci stad zamrazalo je w domknieciu `useCallback` i przycisk
-      // wysylal AKUSTYKE SPRZED zmiany — serwer wstawal z f16, choc w panelu
-      // stalo f32, i wygladalo to na „f32 sie nie da wybrac".
+      // ⛔ NO ARGUMENTS. The server takes the choice from the DATABASE, i.e. the very place
+      // the panel has just saved. Passing values from here froze them in the `useCallback`
+      // closure and the button sent the acoustic part from BEFORE the change.
       const s = await apiClient.reloadTts();
-      setZaladowanyWariant(s.zaladowany_base_lm ?? s.wariant ?? null);
-      setZaladowanaAkustyka(s.zaladowany_akustyka ?? null);
-      setZaladowanyBackend(s.zaladowany_backend ?? null);
-      setZaladowanyOmni(s.zaladowany_omni ?? null);
-      setZaladowanyOmniFlash(s.zaladowany_omni_flash ?? null);
+      setLoadedBaseLm(s.loaded_base_lm ?? null);
+      setLoadedAcoustic(s.loaded_acoustic ?? null);
+      setLoadedBackend(s.loaded_backend ?? null);
+      setLoadedOmni(s.loaded_omni ?? null);
+      setLoadedOmniFlash(s.loaded_omni_flash ?? null);
       toast({
-        title: `Model przeładowany — ${s.zaladowany_base_lm ?? s.wariant} / ${s.zaladowany_akustyka ?? '?'} / ${NAZWA_BACKENDU[s.zaladowany_backend ?? 'hip']}`,
-        description: s.ms ? `Wstał w ${(s.ms / 1000).toFixed(1)} s.` : undefined,
+        title: s.loaded_base_lm
+          ? `Model reloaded — ${s.loaded_base_lm} / ${s.loaded_acoustic ?? '?'} / ${BACKEND_NAMES[s.loaded_backend ?? 'hip']}`
+          : 'Model reloaded',
+        description: s.ms ? `Up in ${(s.ms / 1000).toFixed(1)} s.` : undefined,
       });
     } catch (e) {
       toast({
-        title: 'Nie udało się przeładować modelu',
+        title: 'Could not reload the model',
         description: e instanceof Error ? e.message : String(e),
         variant: 'destructive',
       });
     } finally {
-      setPrzeladowuje(false);
+      setReloading(false);
     }
   }, [toast]);
 
@@ -244,16 +244,33 @@ export function GenerationPage() {
   return (
     <div className="flex gap-8 items-start max-w-5xl">
       <div className="flex-1 min-w-0 max-w-2xl space-y-8">
-      <Tabs value={zakladka} onValueChange={zmienZakladke} className="space-y-6">
+      <Tabs value={tab} onValueChange={changeTab} className="space-y-6">
         <TabsList>
-          <TabsTrigger value="ogolne">Ogólne</TabsTrigger>
+          <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="vox">Vox</TabsTrigger>
           <TabsTrigger value="omni">OmniVoice</TabsTrigger>
           <TabsTrigger value="whisper">Whisper</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="ogolne" className="space-y-8">
-          <WyborKartyGpu />
+        <TabsContent value="general" className="space-y-8">
+          <SettingSection
+            title="Engines"
+            description="The voice engines (audio.cpp, PyTorch) run in their own containers. By default only one model sits on the card at a time — the Offloader unloads the others before a model loads."
+          >
+            <SettingRow
+              title={t('settings.generation.keepAllModels.title')}
+              description={t('settings.generation.keepAllModels.description')}
+              htmlFor="keepAllModels"
+              action={
+                <Toggle
+                  id="keepAllModels"
+                  checked={settings?.keep_all_models ?? false}
+                  onCheckedChange={(v) => update({ keep_all_models: v })}
+                />
+              }
+            />
+          </SettingSection>
+          <GpuPicker />
           <SettingSection
             title={t('settings.generation.title')}
             description={t('settings.generation.description')}
@@ -305,17 +322,17 @@ export function GenerationPage() {
           <SettingRow
             title="Backend"
             description={
-              zaladowanyBackend && zaladowanyBackend !== wybranyBackend
-                ? `Która binarka audio.cpp liczy głos — osobne pliki, nieużywana nic nie zajmuje. Teraz chodzi ${NAZWA_BACKENDU[zaladowanyBackend]}.`
-                : zaladowanyBackend
-                  ? `Która binarka audio.cpp liczy głos — osobne pliki, nieużywana nic nie zajmuje. Chodzi: ${NAZWA_BACKENDU[zaladowanyBackend]}.`
-                  : 'Która binarka audio.cpp liczy głos (Vox i OmniVoice) — osobne pliki, nieużywana nic nie zajmuje.'
+              loadedBackend && loadedBackend !== selectedBackend
+                ? `Which audio.cpp binary computes the voice — separate files, the unused one takes nothing. Running now: ${BACKEND_NAMES[loadedBackend]}.`
+                : loadedBackend
+                  ? `Which audio.cpp binary computes the voice — separate files, the unused one takes nothing. Running: ${BACKEND_NAMES[loadedBackend]}.`
+                  : 'Which audio.cpp binary computes the voice (Vox and OmniVoice) — separate files, the unused one takes nothing.'
             }
             action={
               <Select
-                value={wybranyBackend}
+                value={selectedBackend}
                 onValueChange={(v) => update({ vox_backend: v as VoxBackend })}
-                disabled={!ttsDostepny || przeladowuje}
+                disabled={!ttsAvailable || reloading}
               >
                 <SelectTrigger className="w-[150px]">
                   <SelectValue />
@@ -375,11 +392,11 @@ export function GenerationPage() {
         <TabsContent value="vox" className="space-y-8">
           <SettingSection
             title="Vox (VoxCPM2)"
-            description="Flash attention zawsze włączony — wszystkie miejsca uwagi idą przez FA w naszych łatkach audio.cpp."
+            description="Both Vox engines (audio.cpp and PyTorch) use these settings. Flash attention is always on — every attention goes through FA in our audio.cpp patches."
           >
           <SettingRow
-            title="Trzymanie się nawiasu (cfg)"
-            description="Wyżej — model dokładniej trzyma się opisu w nawiasie, ale mówi płasko. Niżej — żywiej, z większym rozrzutem między generacjami."
+            title="Following the parentheses (cfg)"
+            description="Higher — the model follows the description in parentheses more closely, but speaks flat. Lower — livelier, with more spread between generations."
             action={
               <span className="text-sm tabular-nums text-muted-foreground">
                 {voxCfg.toFixed(1)}
@@ -394,13 +411,13 @@ export function GenerationPage() {
               min={0.5}
               max={5}
               step={0.1}
-              aria-label="Trzymanie się nawiasu"
+              aria-label="Following the parentheses"
             />
           </SettingRow>
 
           <SettingRow
-            title="Kroki dyfuzji"
-            description="Im więcej kroków, tym lepsza jakość. Każdy krok to około 0,06 s."
+            title="Diffusion steps"
+            description="The more steps, the better the quality. Each step costs about 0.06 s."
             action={
               <span className="text-sm tabular-nums text-muted-foreground">
                 {voxTimesteps}
@@ -415,16 +432,16 @@ export function GenerationPage() {
               min={4}
               max={60}
               step={1}
-              aria-label="Kroki dyfuzji"
+              aria-label="Diffusion steps"
             />
           </SettingRow>
 
           <SettingRow
-            title="Temperatura szumu"
+            title="Noise temperature"
             description={
-              'Ile losowości model wpuszcza w dyfuzję. 1,0 to wartość silnika. Niżej — ' +
-              'spokojniej i powtarzalniej, ale płasko. Wyżej — żywiej, za cenę tego, że ' +
-              'ta sama linijka wychodzi za każdym razem inaczej.'
+              'How much randomness the model lets into the diffusion. 1.0 is the engine\'s value. Lower — ' +
+              'calmer and more repeatable, but flat. Higher — livelier, at the price of the ' +
+              'same line coming out differently every time.'
             }
             action={
               <span className="text-sm tabular-nums text-muted-foreground">
@@ -440,98 +457,97 @@ export function GenerationPage() {
               min={0.1}
               max={2}
               step={0.05}
-              aria-label="Temperatura szumu"
+              aria-label="Noise temperature"
             />
           </SettingRow>
 
           <SettingRow
-            title="Ziarno losowe (seed)"
+            title="Random seed"
             description={
-              'Puste — za każdym razem inaczej. Liczba — ta sama linijka daje ten sam ' +
-              'plik co do bajta, więc „wygeneruj jeszcze raz" przestaje cokolwiek zmieniać. '
+              'Empty — different every time. A number — the same line gives the same file ' +
+              'down to the byte, so "generate again" stops changing anything.'
             }
             action={
               <Input
                 id="voxSeed"
                 value={voxSeed}
                 onChange={(e) => setVoxSeed(e.target.value.replace(/\D/g, '').slice(0, 10))}
-                onBlur={zapiszSeed}
+                onBlur={saveSeed}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') e.currentTarget.blur();
                 }}
-                placeholder="losowo"
+                placeholder="random"
                 inputMode="numeric"
                 className="w-[140px] text-right tabular-nums"
-                aria-label="Ziarno losowe"
+                aria-label="Random seed"
               />
             }
           />
 
           <SettingRow
-            title="Wagi — część językowa"
+            title="Weights — language part"
             description={
-              !ttsDostepny
-                ? 'BaseLM — plan wypowiedzi: słowa, akcent, intonacja. Serwer TTS nie chodzi — backend woła CLI.'
-                : zaladowanyWariant && zaladowanyWariant !== wybranyWariant
-                  ? `BaseLM — plan wypowiedzi: słowa, akcent, intonacja. Na karcie siedzi ${zaladowanyWariant}.`
-                  : zaladowanyWariant
-                    ? `BaseLM — plan wypowiedzi: słowa, akcent, intonacja. Na karcie: ${zaladowanyWariant}.`
-                    : 'BaseLM — plan wypowiedzi: słowa, akcent, intonacja. Nic nie jest załadowane.'
+              !ttsAvailable
+                ? 'BaseLM — the plan of the utterance: words, stress, intonation. No audio.cpp engine is configured.'
+                : loadedBaseLm && loadedBaseLm !== selectedBaseLm
+                  ? `BaseLM — the plan of the utterance: words, stress, intonation. On the card now: ${loadedBaseLm}.`
+                  : loadedBaseLm
+                    ? `BaseLM — the plan of the utterance: words, stress, intonation. On the card: ${loadedBaseLm}.`
+                    : 'BaseLM — the plan of the utterance: words, stress, intonation.'
             }
             action={
               <Select
-                value={wybranyWariant}
-                onValueChange={(v) => update({ vox_base_lm: v as VoxWariant })}
-                disabled={!ttsDostepny || przeladowuje}
+                value={selectedBaseLm}
+                onValueChange={(v) => update({ vox_base_lm: v as VoxBaseLm })}
+                disabled={!ttsAvailable || reloading}
               >
                 <SelectTrigger className="w-[150px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="q8">q8 — 1,6 GB</SelectItem>
-                  <SelectItem value="f16">f16 — 3,0 GB</SelectItem>
-                  <SelectItem value="f32">f32 — 6,0 GB</SelectItem>
+                  <SelectItem value="q8">q8 — 1.6 GB</SelectItem>
+                  <SelectItem value="f16">f16 — 3.0 GB</SelectItem>
                 </SelectContent>
               </Select>
             }
           />
 
           <SettingRow
-            title="Wagi — część foniczna"
+            title="Weights — acoustic part"
             description={
-              zaladowanaAkustyka && zaladowanaAkustyka !== wybranaAkustyka
-                ? `DiT, LocEnc, ResidualLM — detal brzmienia. Głowica (AudioVAE) zawsze f32. Na karcie siedzi ${zaladowanaAkustyka}.`
-                : zaladowanaAkustyka
-                  ? `DiT, LocEnc, ResidualLM — detal brzmienia. Głowica (AudioVAE) zawsze f32. Na karcie: ${zaladowanaAkustyka}.`
-                  : 'DiT, LocEnc, ResidualLM — detal brzmienia. Głowica (AudioVAE) zawsze f32.'
+              loadedAcoustic && loadedAcoustic !== selectedAcoustic
+                ? `DiT, LocEnc, ResidualLM — the detail of the sound. The AudioVAE head is always f32. On the card now: ${loadedAcoustic}.`
+                : loadedAcoustic
+                  ? `DiT, LocEnc, ResidualLM — the detail of the sound. The AudioVAE head is always f32. On the card: ${loadedAcoustic}.`
+                  : 'DiT, LocEnc, ResidualLM — the detail of the sound. The AudioVAE head is always f32.'
             }
             action={
               <div className="flex items-center gap-2">
                 <Select
-                  value={wybranaAkustyka}
-                  onValueChange={(v) => update({ vox_akustyka: v as VoxAkustyka })}
-                  disabled={!ttsDostepny || przeladowuje}
+                  value={selectedAcoustic}
+                  onValueChange={(v) => update({ vox_acoustic: v as VoxAcoustic })}
+                  disabled={!ttsAvailable || reloading}
                 >
                   <SelectTrigger className="w-[150px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="f16">f16 — 1,6 GB</SelectItem>
-                    <SelectItem value="f32">f32 — 3,3 GB</SelectItem>
+                    <SelectItem value="f16">f16 — 1.6 GB</SelectItem>
+                    <SelectItem value="f32">f32 — 3.3 GB</SelectItem>
                   </SelectContent>
                 </Select>
                 <Button
-                  variant={doPrzeladowania ? 'default' : 'outline'}
+                  variant={needsReload ? 'default' : 'outline'}
                   size="sm"
-                  onClick={przeladujModel}
-                  disabled={!ttsDostepny || przeladowuje}
+                  onClick={reloadModel}
+                  disabled={!ttsAvailable || reloading}
                 >
-                  {przeladowuje ? (
+                  {reloading ? (
                     <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
                   ) : (
                     <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
                   )}
-                  {przeladowuje ? 'Ładuję…' : 'Przeładuj'}
+                  {reloading ? 'Loading…' : 'Reload'}
                 </Button>
               </div>
             }
@@ -543,29 +559,29 @@ export function GenerationPage() {
         <TabsContent value="omni" className="space-y-8">
           <SettingSection
             title="OmniVoice"
-            description="Ten sam silnik audio.cpp co Vox, jeden model naraz — OmniVoice wchodzi przy pierwszej wypowiedzi nim, Vox wtedy schodzi."
+            description="The same audio.cpp engine as Vox, one model at a time — OmniVoice comes in with its first utterance, and Vox leaves."
           >
           <SettingRow
-            title="Wagi"
+            title="Weights"
             description={
-              zaladowanyOmni && zaladowanyOmni !== wybranyOmni
-                ? `Ten sam silnik co Vox, jeden model naraz — OmniVoice wchodzi przy pierwszej wypowiedzi nim, Vox wtedy schodzi. Na karcie siedzi ${zaladowanyOmni}, nowy wejdzie przy następnej.`
-                : zaladowanyOmni
-                  ? `Ten sam silnik co Vox, jeden model naraz — OmniVoice wchodzi przy pierwszej wypowiedzi nim, Vox wtedy schodzi. Na karcie: ${zaladowanyOmni}.`
-                  : 'Ten sam silnik co Vox, jeden model naraz — OmniVoice wchodzi przy pierwszej wypowiedzi nim, Vox wtedy schodzi.'
+              loadedOmni && loadedOmni !== selectedOmni
+                ? `On the card now: ${loadedOmni} — the new one comes in with the next OmniVoice utterance.`
+                : loadedOmni
+                  ? `On the card: ${loadedOmni}.`
+                  : 'Upstream\'s ready GGUF files.'
             }
             action={
               <Select
-                value={wybranyOmni}
-                onValueChange={(v) => update({ omni_wagi: v as OmniWagi })}
-                disabled={!ttsDostepny}
+                value={selectedOmni}
+                onValueChange={(v) => update({ omni_weights: v as OmniWeights })}
+                disabled={!ttsAvailable}
               >
                 <SelectTrigger className="w-[150px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="q8">q8 — 1,3 GB</SelectItem>
-                  <SelectItem value="f16">f16 — 1,6 GB</SelectItem>
+                  <SelectItem value="q8">q8 — 1.3 GB</SelectItem>
+                  <SelectItem value="f16">f16 — 1.6 GB</SelectItem>
                 </SelectContent>
               </Select>
             }
@@ -575,10 +591,10 @@ export function GenerationPage() {
           <SettingRow
             title="Flash attention"
             description={
-              'Uwaga liczona kafelkami zamiast pełnej macierzy — bez tego OmniVoice trzyma macierz ' +
-              'T×T (próbka + tekst + mowa, razy dwa przez cfg) i VRAM rośnie z najdłuższą wypowiedzią. ' +
-              'Upstream: „mały dryf wyjścia”. Zmiana wchodzi przy następnym załadowaniu OmniVoice.' +
-              (zaladowanyOmniFlash !== null ? ` Teraz: ${zaladowanyOmniFlash ? 'włączony' : 'wyłączony'}.` : '')
+              'Attention computed in tiles instead of the full matrix — without it OmniVoice holds a ' +
+              'T×T matrix (sample + text + speech, times two for cfg) and VRAM grows with the longest utterance. ' +
+              'Upstream: "small output drift". A change takes effect with the next OmniVoice load.' +
+              (loadedOmniFlash !== null ? ` Now: ${loadedOmniFlash ? 'on' : 'off'}.` : '')
             }
             htmlFor="omniFlash"
             action={
@@ -591,8 +607,8 @@ export function GenerationPage() {
           />
 
           <SettingRow
-            title="Trzymanie się opisu (guidance)"
-            description="To samo co cfg u Voxa: wyżej — dokładniej, ale płasko; niżej — żywiej. Domyślne upstreamu: 2,0."
+            title="Following the description (guidance)"
+            description="The same as Vox's cfg: higher — closer, but flat; lower — livelier. Upstream's default: 2.0."
             action={
               <span className="text-sm tabular-nums text-muted-foreground">
                 {omniCfg.toFixed(1)}
@@ -607,148 +623,148 @@ export function GenerationPage() {
               min={0.5}
               max={5}
               step={0.1}
-              aria-label="Trzymanie się opisu"
+              aria-label="Following the description"
             />
           </SettingRow>
 
           <SettingRow
-            title="Kroki"
-            description="Rundy dopracowywania CAŁEJ wypowiedzi naraz (nie krok na kawałek jak u Voxa). Domyślne upstreamu: 32."
+            title="Steps"
+            description="Rounds refining the WHOLE utterance at once (not a step per chunk like Vox). Upstream's default: 32."
             action={
-              <span className="text-sm tabular-nums text-muted-foreground">{omniKroki}</span>
+              <span className="text-sm tabular-nums text-muted-foreground">{omniSteps}</span>
             }
           >
             <Slider
-              id="omniKroki"
-              value={[omniKroki]}
-              onValueChange={([value]) => setOmniKroki(value)}
-              onValueCommit={([value]) => update({ omni_kroki: value })}
+              id="omniSteps"
+              value={[omniSteps]}
+              onValueChange={([value]) => setOmniSteps(value)}
+              onValueCommit={([value]) => update({ omni_steps: value })}
               min={4}
               max={64}
               step={1}
-              aria-label="Kroki OmniVoice"
+              aria-label="OmniVoice steps"
             />
           </SettingRow>
 
           <SettingRow
-            title="Tempo mowy"
-            description="Mnożnik przy szacowaniu długości wypowiedzi — OmniVoice zgaduje ją z tempa próbki, więc próbka z pauzami daje mowę za wolną. Wyżej = szybciej. Domyślne upstreamu: 1,0."
+            title="Speech speed"
+            description="A multiplier for the estimated utterance length — OmniVoice guesses it from the sample's pace, so a sample with pauses gives speech that is too slow. Higher = faster. Upstream's default: 1.0."
             action={
               <span className="text-sm tabular-nums text-muted-foreground">
-                {omniTempo.toFixed(2)}×
+                {omniSpeed.toFixed(2)}×
               </span>
             }
           >
             <Slider
-              id="omniTempo"
-              value={[omniTempo]}
-              onValueChange={([value]) => setOmniTempo(value)}
-              onValueCommit={([value]) => update({ omni_tempo: value })}
+              id="omniSpeed"
+              value={[omniSpeed]}
+              onValueChange={([value]) => setOmniSpeed(value)}
+              onValueCommit={([value]) => update({ omni_speed: value })}
               min={0.5}
               max={2}
               step={0.05}
-              aria-label="Tempo mowy OmniVoice"
+              aria-label="OmniVoice speech speed"
             />
           </SettingRow>
 
           <SettingRow
-            title="Strumień kawałkami"
+            title="Stream in chunks"
             description={
-              'OmniVoice liczy całą wypowiedź naraz, więc dźwięk przychodzi dopiero po wszystkim. ' +
-              'Pocięty tekst gra od pierwszego kawałka, a kolejne liczą się w trakcie (jak --stream-by-line ' +
-              'w omnivoice.cpp). Wyłączone — upstream tnie sam dopiero powyżej 30 s mowy.'
+              'OmniVoice computes the whole utterance at once, so the sound only comes after all of it. ' +
+              'Cut text plays from the first chunk, and the next ones are computed meanwhile (like ' +
+              '--stream-by-line in omnivoice.cpp). Off — upstream cuts by itself only above 30 s of speech.'
             }
             action={
               <Select
-                value={omniChunkTryb}
-                onValueChange={(v) => update({ omni_chunk_tryb: v as 'brak' | 'linie' | 'zdania' })}
+                value={omniChunkMode}
+                onValueChange={(v) => update({ omni_chunk_mode: v as 'none' | 'lines' | 'sentences' })}
               >
                 <SelectTrigger className="w-[150px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="brak">wyłączone</SelectItem>
-                  <SelectItem value="zdania">po zdaniach</SelectItem>
-                  <SelectItem value="linie">po liniach</SelectItem>
+                  <SelectItem value="none">off</SelectItem>
+                  <SelectItem value="sentences">by sentence</SelectItem>
+                  <SelectItem value="lines">by line</SelectItem>
                 </SelectContent>
               </Select>
             }
           />
 
-          {omniChunkTryb !== 'brak' && (
+          {omniChunkMode !== 'none' && (
             <SettingRow
-              title="Maks. znaków w kawałku"
+              title="Max characters per chunk"
               description={
-                omniChunkTryb === 'zdania'
-                  ? 'Zdania pakowane do tego limitu — mniej = wcześniejszy pierwszy dźwięk, ale więcej szwów. Domyślne 160 (przykład strumienia z docs upstreamu).'
-                  : 'Linia kończąca się kropką/pytajnikiem to kawałek; dłuższe od limitu tnie dalej. Domyślne 160 (przykład strumienia z docs upstreamu).'
+                omniChunkMode === 'sentences'
+                  ? 'Sentences packed up to this limit — less = an earlier first sound, but more seams. Default 160 (the streaming example in upstream\'s docs).'
+                  : 'A line ending with a period/question mark is a chunk; longer than the limit gets cut further. Default 160 (the streaming example in upstream\'s docs).'
               }
               action={
-                <span className="text-sm tabular-nums text-muted-foreground">{omniChunkZnaki}</span>
+                <span className="text-sm tabular-nums text-muted-foreground">{omniChunkChars}</span>
               }
             >
               <Slider
-                id="omniChunkZnaki"
-                value={[omniChunkZnaki]}
-                onValueChange={([value]) => setOmniChunkZnaki(value)}
-                onValueCommit={([value]) => update({ omni_chunk_znaki: value })}
+                id="omniChunkChars"
+                value={[omniChunkChars]}
+                onValueChange={([value]) => setOmniChunkChars(value)}
+                onValueCommit={([value]) => update({ omni_chunk_chars: value })}
                 min={20}
                 max={1000}
                 step={10}
-                aria-label="Maks. znaków w kawałku"
+                aria-label="Max characters per chunk"
               />
             </SettingRow>
           )}
 
           <SettingRow
-            title="Ziarno losowe (seed)"
-            description="Puste — za każdym razem inaczej. Liczba — ten sam tekst daje ten sam plik."
+            title="Random seed"
+            description="Empty — different every time. A number — the same text gives the same file."
             action={
               <Input
                 id="omniSeed"
                 value={omniSeed}
                 onChange={(e) => setOmniSeed(e.target.value.replace(/\D/g, '').slice(0, 10))}
-                onBlur={zapiszOmniSeed}
+                onBlur={saveOmniSeed}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') e.currentTarget.blur();
                 }}
-                placeholder="losowo"
+                placeholder="random"
                 className="w-[150px]"
               />
             }
           />
 
           <SettingRow
-            title="Stan"
+            title="State"
             description={
-              zaladowanyOmni
-                ? `Na karcie: OmniVoice ${zaladowanyOmni}${zaladowanyOmniFlash ? ' + flash attention' : ''}.` +
-                  (omniRozjazd ? ' Wybór się różni — przeładuj albo zrobi to następna wypowiedź OmniVoice.' : '')
-                : 'Nie jest załadowany — wejdzie przy pierwszej wypowiedzi OmniVoice (Vox wtedy schodzi).'
+              loadedOmni
+                ? `On the card: OmniVoice ${loadedOmni}${loadedOmniFlash ? ' + flash attention' : ''}.` +
+                  (omniMismatch ? ' The choice differs — reload, or the next OmniVoice utterance will.' : '')
+                : 'Not loaded — it comes in with the first OmniVoice utterance (Vox leaves then).'
             }
             action={
               <div className="flex items-center gap-2">
                 <Button
-                  variant={omniRozjazd ? 'default' : 'outline'}
+                  variant={omniMismatch ? 'default' : 'outline'}
                   size="sm"
-                  onClick={przeladujOmni}
-                  disabled={!ttsDostepny || omniPracuje}
+                  onClick={reloadOmni}
+                  disabled={!ttsAvailable || omniBusy}
                 >
-                  {omniPracuje ? (
+                  {omniBusy ? (
                     <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
                   ) : (
                     <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
                   )}
-                  {omniPracuje ? 'Pracuję…' : zaladowanyOmni ? 'Przeładuj' : 'Załaduj'}
+                  {omniBusy ? 'Working…' : loadedOmni ? 'Reload' : 'Load'}
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={rozladujOmni}
-                  disabled={omniPracuje || !zaladowanyOmni}
+                  onClick={unloadOmni}
+                  disabled={omniBusy || !loadedOmni}
                 >
                   <Unplug className="h-3.5 w-3.5 mr-1.5" />
-                  Rozładuj
+                  Unload
                 </Button>
               </div>
             }
@@ -757,7 +773,7 @@ export function GenerationPage() {
         </TabsContent>
 
         <TabsContent value="whisper" className="space-y-8">
-          <WhisperUstawienia />
+          <WhisperSettings />
         </TabsContent>
       </Tabs>
       </div>

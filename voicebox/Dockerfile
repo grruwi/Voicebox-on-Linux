@@ -1,19 +1,19 @@
-# Voicebox (backend + panel webowy) bez torcha. Mowa idzie z kontenera `audiocpp`,
-# rozpoznawanie mowy z kontenera `whisper` — tu siedzi tylko API, panel i MCP.
+# Voicebox — the backend + web panel + MCP, without torch. Speech comes from the engine
+# containers (`audiocpp`, optionally `pytorch`), speech recognition from `whisper`.
 
 FROM oven/bun:1 AS frontend
 WORKDIR /build
 COPY package.json bun.lock CHANGELOG.md ./
 COPY app/ ./app/
 COPY web/ ./web/
-# workspace'y desktopowe (tauri, landing) nie wchodza do repo
+# the desktop workspaces (tauri, landing) are not part of this repo
 RUN sed -i '/"tauri"/d; /"landing"/d' package.json && sed -i -z 's/,\n  ]/\n  ]/' package.json
 RUN bun install --no-save
 RUN cd web && bunx --bun vite build
 
 
 FROM python:3.12-slim
-# ffmpeg — konwersja probek; ffplay z niego gra na glosnikach serwera (opcjonalne, patrz compose)
+# ffmpeg — sample conversion; its ffplay plays on the server's speakers (optional, see compose)
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -22,15 +22,12 @@ RUN pip install --no-cache-dir -r requirements-slim.txt
 COPY backend/ /app/backend/
 COPY --from=frontend /build/web/dist /app/frontend/
 
-# Bez tego Voicebox buduje domyslny silnik PyTorchowy (torcha w obrazie nie ma).
-ENV VOICEBOX_TYLKO_VOXCPM=1 \
-    VOXCPM_GGUF=1 \
-    VOICEBOX_STT_ENGINE=whispercpp \
-    VOXCPM_SERWER=http://audiocpp:17496 \
-    AUDIOCPP_ZARZADCA=http://audiocpp:17495 \
-    VOICEBOX_MODELE=/modele \
+# Engine addresses are the compose service names; models are mounted at /models.
+ENV VOICEBOX_VOICE_MODELS=/models \
     HOME=/app/data \
-    NUMBA_CACHE_DIR=/app/data/numba-cache
+    HF_HOME=/app/data/hf \
+    NUMBA_CACHE_DIR=/app/data/numba-cache \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 17493
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \

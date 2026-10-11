@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'react';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
-import { grajStrumien, zagranoStrumieniem, zatrzymajStrumienie } from '@/lib/utils/strumienMowy';
+import { playedByStream, playStream, stopStreams } from '@/lib/utils/speechStream';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
 
@@ -42,9 +42,9 @@ export function useGenerationProgress() {
   isPlayingRef.current = isPlaying;
   autoplayRef.current = autoplayOnGenerate;
 
-  // Uzytkownik puscil cos w glownym odtwarzaczu — strumien mowy milknie, nie gra pod spodem.
+  // The user played something in the main player — the speech stream goes quiet, it does not play underneath.
   useEffect(() => {
-    if (isPlaying) zatrzymajStrumienie();
+    if (isPlaying) stopStreams();
   }, [isPlaying]);
 
   // Track active EventSource instances
@@ -79,10 +79,10 @@ export function useGenerationProgress() {
       const url = apiClient.getGenerationStatusUrl(id);
       const source = new EventSource(url);
 
-      // ⭐ Autoplay zaznaczony = gramy strumieniem w trakcie liczenia (backend oddaje kawalki
-      // zamiast ffplay). 204 z backendu = nie strumieniem; wtedy plik po calosci nizej.
+      // ⭐ Autoplay checked = we play the stream while it is computed (the backend hands over
+      // chunks instead of ffplay). 204 from the backend = not streamed; then the whole file below.
       if (autoplayRef.current && !isPlayingRef.current) {
-        void grajStrumien(apiClient.getGenerationStreamUrl(id), id);
+        void playStream(apiClient.getGenerationStreamUrl(id), id);
       }
 
       source.onmessage = (event) => {
@@ -136,7 +136,7 @@ export function useGenerationProgress() {
               autoplayRef.current &&
               !isPlayingRef.current &&
               !isAgentSpeak &&
-              !zagranoStrumieniem(id)
+              !playedByStream(id)
             ) {
               const genAudioUrl = apiClient.getAudioUrl(id);
               setAudioWithAutoPlay(genAudioUrl, id, '', '');

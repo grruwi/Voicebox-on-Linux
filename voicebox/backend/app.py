@@ -63,13 +63,13 @@ if not os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
             for line in result.stdout.splitlines():
                 line_lower = line.lower()
                 if "gfx" in line_lower:
-                    # ⛔ `\d+` lapie tez "gfx11" z linii
-                    # "amdgcn-amd-amdhsa--gfx11-generic", ktora rocminfo
-                    # wypisuje obok prawdziwego gfx1100. Ta falszywka staje sie
-                    # liczba 11, wygrywa `min()` i wlacza override na RDNA2 —
-                    # czyli 7900 XTX udaje RX 6000 i HIP wywala segfault przy
-                    # tworzeniu kolejki. Prawdziwe nazwy maja min. 3 cyfry
-                    # (gfx900, gfx1030, gfx1100), wiec {3,} odsiewa smiec.
+                    # ⛔ `\d+` also catches "gfx11" from the line
+                    # "amdgcn-amd-amdhsa--gfx11-generic", which rocminfo prints
+                    # next to the real gfx1100. That fake becomes the number 11,
+                    # wins `min()` and turns on the RDNA2 override — the 7900 XTX
+                    # pretends to be an RX 6000 and HIP segfaults while creating a
+                    # queue. Real names have at least 3 digits (gfx900, gfx1030,
+                    # gfx1100), so {3,} filters out the junk.
                     match = re.search(r"(gfx\d{3,})", line_lower)
                     if match:
                         gfx_versions.append(match.group(1))
@@ -114,7 +114,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote
 
 from . import __version__, config, database
-from .services import tts, transcribe, llm
 from .database import get_db
 from .utils.platform_detect import get_backend_type
 from .utils.progress import get_progress_manager
@@ -227,31 +226,29 @@ def _mount_frontend(application: FastAPI) -> None:
             name="frontend-assets",
         )
 
-    # ⚠️ GUI I API DZIELA SCIEZKI: `/settings/generation` to zakladka w
-    # przegladarce ORAZ endpoint JSON, a router API wygrywa z catch-allem nizej.
-    # Objaw: F5 na zakladce wypluwa goly JSON i nie da sie wrocic do GUI bez
-    # zmiany adresu. Rozstrzyga naglowek `Accept` — przegladarka prosi o
-    # `text/html` i dostaje SPA, `fetch` prosi o `*/*` i dostaje JSON jak dotad.
-    # Middleware, bo musi zadzialac PRZED routingiem.
-    # ⛔ Nie ruszac routingu we froncie: proba hash routingu 16.08 dala szary ekran.
-    # ⚠️ ROZSTRZYGA `Sec-Fetch-Mode`, NIE `Accept`. Przegladarka wysyla
-    # `navigate` przy F5 i wpisaniu adresu, a `fetch()` — `cors`/`same-origin`.
-    # Accept zostaje jako zapas dla klientow bez `Sec-Fetch-*`.
-    # ⛔ `Vary` i `no-store` SA KONIECZNE, nie kosmetyczne: pod jednym adresem
-    # zyja dwie rozne odpowiedzi, a `FileResponse` dokleja `etag`. Bez tego
-    # przegladarka zapisuje HTML z F5 i podaje go potem WLASNEMU `fetch`-owi —
-    # `response.json()` rzuca, zapytanie pada po cichu, a GUI zostaje na
-    # wartosciach domyslnych do pierwszego zapisu (PUT nie jest cache'owany).
+    # ⚠️ THE GUI AND THE API SHARE PATHS: `/settings/generation` is a tab in the browser
+    # AND a JSON endpoint, and the API router wins over the catch-all below.
+    # Symptom: F5 on the tab spits out raw JSON and there is no way back to the GUI
+    # without changing the address. Middleware, because it has to act BEFORE routing.
+    # ⛔ Do not touch the frontend routing: trying hash routing on 16.08 gave a grey screen.
+    # ⚠️ `Sec-Fetch-Mode` DECIDES, NOT `Accept`. The browser sends `navigate` on F5 and on
+    # a typed address, and `fetch()` sends `cors`/`same-origin`. Accept stays as a fallback
+    # for clients without `Sec-Fetch-*`.
+    # ⛔ `Vary` and `no-store` ARE NEEDED, not cosmetic: two different responses live under
+    # one address, and `FileResponse` adds an `etag`. Without them the browser stores the
+    # HTML from F5 and later hands it to its OWN `fetch` — `response.json()` throws, the
+    # request fails silently, and the GUI stays on defaults until the first save (PUT is
+    # not cached).
     @application.middleware("http")
-    async def spa_dla_przegladarki(request, call_next):
+    async def spa_for_the_browser(request, call_next):
         if request.method == "GET" and request.url.path.startswith("/settings"):
-            tryb = request.headers.get("sec-fetch-mode")
-            nawigacja = (
-                tryb == "navigate"
-                if tryb
+            mode = request.headers.get("sec-fetch-mode")
+            navigation = (
+                mode == "navigate"
+                if mode
                 else "text/html" in request.headers.get("accept", "")
             )
-            if nawigacja:
+            if navigation:
                 return FileResponse(
                     frontend_dir / "index.html",
                     media_type="text/html",
@@ -260,11 +257,11 @@ def _mount_frontend(application: FastAPI) -> None:
                         "Cache-Control": "no-store",
                     },
                 )
-        odpowiedz = await call_next(request)
+        response = await call_next(request)
         if request.method == "GET" and request.url.path.startswith("/settings"):
-            odpowiedz.headers["Vary"] = "Sec-Fetch-Mode, Accept"
-            odpowiedz.headers["Cache-Control"] = "no-store"
-        return odpowiedz
+            response.headers["Vary"] = "Sec-Fetch-Mode, Accept"
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     # SPA catch-all: serve files if they exist, otherwise index.html for
     # client-side routes like /voices, /stories, /models, etc.
@@ -282,9 +279,9 @@ def _mount_frontend(application: FastAPI) -> None:
 def _get_gpu_status() -> str:
     """Return a human-readable string describing GPU availability.
 
-    ⭐ Nie importuje torcha. Ta funkcja idzie w log na starcie, a start ma nie
-    ciagnac PyTorcha — kiedy torch jeszcze nie siedzi w procesie, karte opisuje
-    `gpu_probe` (sysfs + rocminfo).
+    ⭐ Does not import torch. This goes into the startup log, and startup must not pull
+    PyTorch in — when torch is not in the process, `gpu_probe` (sysfs + rocminfo)
+    describes the card.
     """
     import sys
 
@@ -293,7 +290,7 @@ def _get_gpu_status() -> str:
     backend_type = get_backend_type()
     torch = sys.modules.get("torch")
     if torch is None:
-        return gpu_probe.etykieta_bez_torcha() or "None (CPU only)"
+        return gpu_probe.label_without_torch() or "None (CPU only)"
 
     if torch.cuda.is_available():
         from .backends.base import check_cuda_compatibility
@@ -390,32 +387,25 @@ async def _run_startup(application: FastAPI) -> None:
     if not _compatible:
         logger.warning("GPU COMPATIBILITY: %s", _cuda_warning)
 
-    from .services.cuda import check_and_update_cuda_binary
-    from .services.rocm import check_and_update_rocm_binary
+    # ⛔ No CUDA/ROCm backend auto-update: upstream downloads GPU builds of PyTorch for
+    # its in-process engines, and this build has none — the engines live in containers.
 
-    create_background_task(check_and_update_cuda_binary())
-    create_background_task(check_and_update_rocm_binary())
+    # ⭐ No model loads with Voicebox — a model loads when it is asked for (the engine
+    # containers stay up, empty). Whisper at startup only if the panel says so
+    # (`whisper_on_startup`). In the background: a model takes seconds and must not
+    # hold the API back.
+    from .services import whisper_host
 
-    # ⭐ Gospodarz ggml + whisper przy starcie — przelacznik w panelu (`whisper_przy_starcie`),
-    # model/kwant/urzadzenie tez z panelu. W tle: start gospodarza i model trwaja
-    # sekundy i nie moze wstrzymywac wstawania API.
-    from .services import whisper_serwer
-
-    async def _whisper_przy_starcie():
-        # JEDNA RURA: gospodarz ggml wstaje z Voiceboxem PUSTY (sam backend),
-        # modele laduja sie w nim na zadanie.
-        from .services import gospodarz
-
+    async def _engines_on_startup():
         try:
-            await asyncio.to_thread(gospodarz.upewnij)
-            # Whisper zyje w osobnym kontenerze — dostaje lustro wyboru z panelu.
-            await asyncio.to_thread(whisper_serwer.synchronizuj)
-            if whisper_serwer.przy_starcie():
-                await asyncio.to_thread(whisper_serwer.uruchom)
+            # Whisper lives in its own container — it gets the panel's selection mirror.
+            await asyncio.to_thread(whisper_host.sync)
+            if whisper_host.on_startup():
+                await asyncio.to_thread(whisper_host.start)
         except Exception as e:
-            logger.warning("gospodarz/whisper przy starcie nie wstal: %s", e)
+            logger.warning("whisper did not come up at startup: %s", e)
 
-    create_background_task(_whisper_przy_starcie())
+    create_background_task(_engines_on_startup())
 
     try:
         progress_manager = get_progress_manager()
@@ -436,20 +426,15 @@ async def _run_startup(application: FastAPI) -> None:
 
 
 async def _run_shutdown() -> None:
-    """Unload models on lifespan exit."""
+    """Voicebox down = every engine host drops its model (the containers stay up).
+    Whisper is not an engine host — it is the dictation's, not Voicebox's."""
+    from .services import engine_host
+
     logger.info("Voicebox server shutting down...")
     try:
-        tts.unload_tts_model()
-    except Exception:
-        logger.exception("Failed to unload TTS model")
-    try:
-        transcribe.unload_whisper_model()
-    except Exception:
-        logger.exception("Failed to unload Whisper model")
-    try:
-        llm.unload_llm_model()
-    except Exception:
-        logger.exception("Failed to unload LLM model")
+        await asyncio.to_thread(engine_host.unload_all)
+    except engine_host.EngineHostError as e:
+        logger.error("Shutdown: %s", e)
 
 
 app = create_app()

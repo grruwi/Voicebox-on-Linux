@@ -1,5 +1,5 @@
-# Rozpoznawanie mowy: whisper.cpp (whisper-server) na Vulkanie + zarzadca (zarzadca.py).
-# Model, kwant i karta/procesor wybiera sie w panelu Voiceboxa (zakladka Whisper).
+# Speech recognition: whisper.cpp (whisper-server) on Vulkan + the manager (manager.py).
+# The model, quantization and GPU/CPU are chosen in the Voicebox panel (Whisper tab).
 
 FROM debian:trixie-slim AS build
 RUN apt-get update \
@@ -21,9 +21,9 @@ RUN echo "deb http://deb.debian.org/debian trixie-backports main" > /etc/apt/sou
  && apt-get install -y --no-install-recommends -t trixie-backports mesa-vulkan-drivers \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/bin/whisper-server /whisper/bin/whisper-server
-COPY zarzadca.py /app/zarzadca.py
-# wagi: /whisper/wagi (montowane), lustro wyboru i cache shaderow: /dane
-ENV XDG_CACHE_HOME=/dane/cache \
+COPY manager.py /app/manager.py
+# weights: /whisper/weights (mounted); the selection mirror and the shader cache: /data
+ENV XDG_CACHE_HOME=/data/cache \
     PYTHONUNBUFFERED=1
 EXPOSE 17480
-CMD ["python", "/app/zarzadca.py"]
+CMD ["python", "/app/manager.py"]

@@ -1,27 +1,28 @@
 """
-OmniVoice (k2-fsa, 600+ jezykow) przez audio.cpp — backend, ktory NIE LADUJE ZADNYCH WAG.
+OmniVoice (k2-fsa, 600+ languages) on audio.cpp — a backend that LOADS NO WEIGHTS.
 
-Ten sam silnik co vox (`audiocpp_server` w kontenerze `audiocpp`, `services/gospodarz.py`),
-inna rodzina modelu. ⭐ JEDEN MODEL NARAZ (decyzja grruwiego 10.10): zaladowanie OmniVoice
-= restart silnika z samym nim, vox schodzi — i odwrotnie. Offloader Voiceboxa
-(`evict_other_models`) i tak zdejmuje inne TTS przed ladowaniem; zarzadca kontenera
-pilnuje tego drugi raz, na poziomie procesu.
+The same engine as Vox (`audiocpp_server` in the `audiocpp` container,
+`services/audiocpp_host.py`), another model family. ⭐ ONE MODEL AT A TIME (grruwi's call
+10.10): loading OmniVoice = restarting the engine with it alone, Vox goes — and the other
+way round. Voicebox's Offloader unloads the other engine hosts before loading; the
+container's manager enforces one model a second time, at the process level.
 
-Wagi: gotowe GGUF-y upstreamu (HF `audio-cpp/audio.cpp-gguf`, `OmniVoice-GGUF/`)
-w `voice-models/audiocpp/wagi/omnivoice/`, wariant z panelu (`omni_wagi`: q8 | f16).
+Weights: upstream's ready GGUFs (HF `audio-cpp/audio.cpp-gguf`, `OmniVoice-GGUF/`)
+in `<models>/audiocpp/weights/omnivoice/`, the variant from the panel (`omni_weights`: q8 | f16).
 
-Klonowanie: probka profilu (`voice_ref`, sciezka) + transkrypt (`reference_text`).
-Bez probki: `instruct` = voice design („female, young adult, moderate pitch"),
-bez obu = glos automatyczny.
+Cloning: the profile sample (`voice_ref`, a path) + its transcript (`reference_text`).
+No sample: `instruct` = voice design ("female, young adult, moderate pitch"),
+neither = an automatic voice.
 
-⭐ WLASNE SUWAKI (zakladka OmniVoice w ustawieniach, 11.10): `omni_cfg` → `guidance_scale`,
-`omni_kroki` → `num_inference_steps`, `omni_seed` → `seed`. Puste = default upstreamu
-(guidance 2,0, 32 kroki, ziarno losowe). `omni_flash` = `omnivoice.perf_mode=flash_attention`
-(sesja, zmiana = restart silnika przy nastepnym ladowaniu) — bez niego uwaga liczy pelna
-macierz T×T (T = probka + tekst + mowa, x2 przez CFG) i VRAM rosnie z najdluzsza wypowiedzia.
-Reszta pokretel (speed, duration_sec, shift, denoise, temperatury, ...) = defaulty upstreamu. OmniVoice to model niekauzalny: liczy cala wypowiedz naraz
-i dlugosc zgaduje z gory (z tempa probki), wiec strumien = jeden kawalek na koniec,
-chyba ze ktos ustawi `text_chunk_size` (pseudo-streaming upstreamu).
+⭐ ITS OWN SLIDERS (the OmniVoice tab in settings, 11.10): `omni_cfg` → `guidance_scale`,
+`omni_steps` → `num_inference_steps`, `omni_seed` → `seed`. Empty = upstream's default
+(guidance 2.0, 32 steps, a random seed). `omni_flash` = `omnivoice.perf_mode=flash_attention`
+(a session option, a change = an engine restart at the next load) — without it attention
+computes the full T×T matrix (T = sample + text + speech, x2 for CFG) and VRAM grows with
+the longest utterance. The other knobs (duration_sec, shift, denoise, temperatures, ...) =
+upstream's defaults. OmniVoice is a non-causal model: it computes the whole utterance at
+once and guesses the length up front (from the sample's pace), so the stream = one chunk at
+the end, unless `text_chunk_size` is set (upstream's pseudo-streaming).
 """
 
 import asyncio
@@ -33,66 +34,64 @@ from typing import ClassVar, List, Optional, Tuple
 
 import numpy as np
 
+from ..services import audiocpp_host
 from .base import combine_voice_prompts as _combine_voice_prompts
 
 logger = logging.getLogger(__name__)
 
 OMNIVOICE_SAMPLE_RATE = 24000
 
-# Pseudo-strumien (zakladka OmniVoice, 11.10 — odpowiednik `--stream-by-line` z omnivoice.cpp):
-# tekst ciety na kawalki, kazdy liczony i wypuszczany osobno, wiec pierwszy dzwiek przychodzi
-# po pierwszym kawalku zamiast po calosci. „brak" = nic nie wysylamy (upstream sam tnie
-# dopiero powyzej 30 s mowy). 160 znakow = wartosc z przykladow strumienia w docs upstreamu.
-_TRYBY_CIECIA = {"linie": "endline", "zdania": "tag_aware"}
-_ZNAKI_CIECIA = 160
+# Pseudo-stream (the OmniVoice tab, 11.10 — the counterpart of omnivoice.cpp's `--stream-by-line`):
+# the text is cut into chunks, each computed and sent separately, so the first sound comes
+# after the first chunk instead of after the whole thing. "none" = nothing sent (upstream
+# itself only cuts above 30 s of speech). 160 characters = the value from upstream's stream examples.
+_CHUNK_MODES = {"lines": "endline", "sentences": "tag_aware"}
+_CHUNK_CHARS = 160
 
 
 class OmniVoiceBackend:
-    """OmniVoice na audio.cpp. Wagi zyja w silniku (kontener `audiocpp`), nie tutaj."""
+    """OmniVoice on audio.cpp. The weights live in the engine (the `audiocpp` container), not here."""
+
+    # The Offloader unloads every OTHER engine host before this one loads.
+    ENGINE_HOST: ClassVar[str] = audiocpp_host.HOST
 
     def __init__(self):
         self.model_size = "default"
 
-    # ─────────────────────────────────────────────── wagi i silnik
+    # ─────────────────────────────────────────────── weights and engine
 
     @staticmethod
-    def _wariant() -> str:
-        from ..services import tts_serwer
+    def _variant() -> str:
+        from ..services import audiocpp_settings
 
-        return tts_serwer.wybrany_omni()
+        return audiocpp_settings.selected_omni()
 
-    def _plik(self) -> Path:
-        from ..services import gospodarz, tts_serwer
+    def _file(self) -> Path:
+        from ..services import audiocpp_settings
 
-        return gospodarz.wagi_omni(tts_serwer.OMNI_WARIANTY[self._wariant()])
+        return audiocpp_host.omni_weights(audiocpp_settings.OMNI_TYPES[self._variant()])
 
     def is_loaded(self) -> bool:
-        from ..services import gospodarz
-
-        return gospodarz.stan().get("omni") is not None
+        return audiocpp_host.state().get("omni") is not None
 
     def _get_model_path(self, model_size: str = "default") -> str:
-        return str(self._plik())
+        return str(self._file())
 
     def _is_model_cached(self, model_size: str = "default") -> bool:
-        return self._plik().is_file()
+        return self._file().is_file()
 
     async def load_model(self, model_size: str = "default") -> None:
-        """Laduje OmniVoice do silnika (wariant z panelu), jesli nie siedzi tam juz ten sam."""
-        from ..services import gospodarz
+        """Loads OmniVoice into the engine (the panel's variant), unless the same one sits there."""
+        from ..services import audiocpp_settings
 
-        if not self._serwer:
-            raise RuntimeError("OmniVoice wymaga silnika audio.cpp — VOXCPM_SERWER jest pusty")
-        from ..services import tts_serwer
-
-        await asyncio.to_thread(gospodarz.zaladuj_omni, self._wariant(), tts_serwer.wybrany_omni_flash())
+        if not self._engine:
+            raise RuntimeError("OmniVoice needs the audio.cpp engine — AUDIOCPP_ENGINE is empty")
+        await asyncio.to_thread(audiocpp_host.load_omni, self._variant(), audiocpp_settings.selected_omni_flash())
 
     def unload_model(self) -> None:
-        """Oddaje VRAM — zdejmuje OmniVoice z silnika, proces zostaje."""
-        from ..services import gospodarz
-
-        if gospodarz.stoi() and gospodarz.zdejmij_omni():
-            logger.info("OmniVoice zdjety z silnika — VRAM oddany")
+        """Gives VRAM and RAM back — the engine process stops, the container stays."""
+        if self.is_loaded() and audiocpp_host.unload():
+            logger.info("OmniVoice unloaded from the engine — VRAM given back")
 
     async def create_voice_prompt(
         self,
@@ -107,87 +106,88 @@ class OmniVoiceBackend:
         audio_paths: List[str],
         reference_texts: List[str],
     ) -> Tuple[np.ndarray, str]:
-        # Sklejanie probek to numpy na CPU — dziala tak samo, silnik nieistotny.
+        # Joining samples is numpy on the CPU — works the same, the engine does not matter.
         return await _combine_voice_prompts(audio_paths, reference_texts)
 
-    # ─────────────────────────────────────────────── zadanie
+    # ─────────────────────────────────────────────── request
 
     @staticmethod
-    def _suwaki() -> dict:
-        """cfg / kroki / seed z zakladki OmniVoice. Brak wartosci = nie wysylamy (default upstreamu)."""
-        wynik: dict = {}
+    def _sliders() -> dict:
+        """cfg / steps / seed from the OmniVoice tab. No value = not sent (upstream's default)."""
+        result: dict = {}
         try:
-            # MODUL, nie nazwa — `SessionLocal` wypelnia dopiero `init_db()`.
-            from ..database import session as db_session
+            # The MODULE, not the name — `SessionLocal` is only filled in by `init_db()`.
             from ..database import GenerationSettings
+            from ..database import session as db_session
 
             s = db_session.SessionLocal()
             try:
-                w = s.query(GenerationSettings).first()
-                if w is not None:
-                    if getattr(w, "omni_cfg", None) is not None:
-                        wynik["guidance_scale"] = float(w.omni_cfg)
-                    if getattr(w, "omni_kroki", None) is not None:
-                        wynik["num_inference_steps"] = int(w.omni_kroki)
-                    if getattr(w, "omni_seed", None) is not None:
-                        wynik["seed"] = int(w.omni_seed)
-                    if getattr(w, "omni_tempo", None) is not None:
-                        wynik["speed"] = float(w.omni_tempo)
-                    tryb = getattr(w, "omni_chunk_tryb", None) or "brak"
-                    if tryb in _TRYBY_CIECIA:
-                        wynik["text_chunk_mode"] = _TRYBY_CIECIA[tryb]
-                        wynik["text_chunk_size"] = int(getattr(w, "omni_chunk_znaki", None) or _ZNAKI_CIECIA)
+                row = s.query(GenerationSettings).first()
+                if row is not None:
+                    if getattr(row, "omni_cfg", None) is not None:
+                        result["guidance_scale"] = float(row.omni_cfg)
+                    if getattr(row, "omni_steps", None) is not None:
+                        result["num_inference_steps"] = int(row.omni_steps)
+                    if getattr(row, "omni_seed", None) is not None:
+                        result["seed"] = int(row.omni_seed)
+                    if getattr(row, "omni_speed", None) is not None:
+                        result["speed"] = float(row.omni_speed)
+                    mode = getattr(row, "omni_chunk_mode", None) or "none"
+                    if mode in _CHUNK_MODES:
+                        result["text_chunk_mode"] = _CHUNK_MODES[mode]
+                        result["text_chunk_size"] = int(getattr(row, "omni_chunk_chars", None) or _CHUNK_CHARS)
             finally:
                 s.close()
         except Exception as e:
-            logger.debug("suwaki OmniVoice nie z bazy (%s) — defaulty upstreamu", e)
-        return wynik
+            logger.debug("OmniVoice sliders not from the database (%s) — upstream's defaults", e)
+        return result
 
-    def _zadanie(self, text: str, voice_prompt: dict, language: Optional[str],
+    def _request(self, text: str, voice_prompt: dict, language: Optional[str],
                  seed: Optional[int], instruct: Optional[str]) -> dict:
-        """Cialo `/v1/audio/speech` wspolne dla strumienia i calosci."""
-        zad = {
+        """The `/v1/audio/speech` body shared by the stream and the whole take."""
+        request = {
             "model": "omnivoice",
             "input": text,
-            # probki float32 (nasza latka w `app/server/runtime.cpp`, wspolna dla rodzin)
+            # float32 samples (our patch in `app/server/runtime.cpp`, shared by the families)
             "sample_format": "f32",
             "options": {},
         }
         ref_audio = voice_prompt.get("ref_audio")
         if ref_audio and not Path(ref_audio).exists():
-            logger.warning("nie ma probki referencyjnej: %s", ref_audio)
+            logger.warning("no reference sample: %s", ref_audio)
             ref_audio = None
         if ref_audio:
-            # Sciezka ABSOLUTNA — silnik widzi /app/data pod ta sama sciezka (kontener `audiocpp`).
-            zad["voice_ref"] = {"type": "path", "path": str(Path(ref_audio).resolve())}
+            # An ABSOLUTE path — the engine sees /app/data under the same path (the `audiocpp` container).
+            request["voice_ref"] = {"type": "path", "path": str(Path(ref_audio).resolve())}
             if voice_prompt.get("ref_text"):
-                zad["reference_text"] = voice_prompt["ref_text"]
+                request["reference_text"] = voice_prompt["ref_text"]
         if instruct:
-            zad["options"]["instruction"] = instruct
+            request["options"]["instruction"] = instruct
         if language:
-            zad["options"]["language"] = language
-        suwaki = self._suwaki()
-        if "guidance_scale" in suwaki:
-            zad["guidance_scale"] = suwaki["guidance_scale"]
-        if "num_inference_steps" in suwaki:
-            zad["num_inference_steps"] = suwaki["num_inference_steps"]
-        # Ziarno: z wywolania, potem z panelu. Puste = silnik ciagnie dalej swoj RNG sesji
-        # (rozne przy kazdej generacji).
-        if "speed" in suwaki:
-            # tempo = mnoznik przy szacowaniu dlugosci mowy (model zgaduje ja z tempa probki)
-            zad["options"]["speed"] = suwaki["speed"]
-        if "text_chunk_mode" in suwaki:
-            zad["options"]["text_chunk_mode"] = suwaki["text_chunk_mode"]
-            zad["options"]["text_chunk_size"] = suwaki["text_chunk_size"]
-        ziarno = seed if seed is not None else suwaki.get("seed")
-        if ziarno is not None:
-            zad["seed"] = int(ziarno)
-        logger.info("[OmniVoice/audio.cpp] wagi=%s cfg=%s kroki=%s tempo=%s ciecie=%s/%s seed=%s jezyk=%s | ref=%s instruct=%s",
-                    self._wariant(), zad.get("guidance_scale", "-"), zad.get("num_inference_steps", "-"),
-                    zad["options"].get("speed", "-"), zad["options"].get("text_chunk_mode", "-"), zad["options"].get("text_chunk_size", "-"),
-                    zad.get("seed", "-"), language or "auto",
-                    "tak" if ref_audio else "nie", "tak" if instruct else "nie")
-        return zad
+            request["options"]["language"] = language
+        sliders = self._sliders()
+        if "guidance_scale" in sliders:
+            request["guidance_scale"] = sliders["guidance_scale"]
+        if "num_inference_steps" in sliders:
+            request["num_inference_steps"] = sliders["num_inference_steps"]
+        if "speed" in sliders:
+            # speed = a multiplier when estimating the speech length (the model guesses it from the sample's pace)
+            request["options"]["speed"] = sliders["speed"]
+        if "text_chunk_mode" in sliders:
+            request["options"]["text_chunk_mode"] = sliders["text_chunk_mode"]
+            request["options"]["text_chunk_size"] = sliders["text_chunk_size"]
+        # Seed: from the call, then from the panel. Empty = the engine keeps drawing from its
+        # session RNG (different on every generation).
+        chosen = seed if seed is not None else sliders.get("seed")
+        if chosen is not None:
+            request["seed"] = int(chosen)
+        logger.info("[OmniVoice/audio.cpp] weights=%s cfg=%s steps=%s speed=%s chunks=%s/%s seed=%s language=%s | ref=%s instruct=%s",
+                    self._variant(), request.get("guidance_scale", "-"), request.get("num_inference_steps", "-"),
+                    request["options"].get("speed", "-"), request["options"].get("text_chunk_mode", "-"),
+                    request["options"].get("text_chunk_size", "-"),
+                    request.get("seed", "-"), language or "auto",
+                    "yes" if ref_audio else "no", "yes" if instruct else "no")
+        return request
 
     async def generate(
         self,
@@ -198,19 +198,19 @@ class OmniVoiceBackend:
         instruct: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
         await self.load_model()
-        zad = self._zadanie(text, voice_prompt, language, seed, instruct)
-        zad["response_format"] = "wav"
-        return await asyncio.to_thread(self._generuj, zad)
+        request = self._request(text, voice_prompt, language, seed, instruct)
+        request["response_format"] = "wav"
+        return await asyncio.to_thread(self._generate, request)
 
-    def _generuj(self, zad: dict) -> Tuple[np.ndarray, int]:
+    def _generate(self, request: dict) -> Tuple[np.ndarray, int]:
         import requests
         import soundfile as sf
 
-        odp = requests.post(self._serwer.rstrip("/") + "/v1/audio/speech", json=zad, timeout=900)
-        if odp.status_code != 200 or not odp.content.startswith(b"RIFF"):
-            raise RuntimeError(f"audio.cpp: HTTP {odp.status_code} {odp.content[:300]!r}")
-        # `soundfile`, NIE `wave` — `wave` zna tylko PCM i pada na WAV-ie float32.
-        audio, sr = sf.read(io.BytesIO(odp.content), dtype="float32")
+        response = requests.post(self._engine.rstrip("/") + "/v1/audio/speech", json=request, timeout=900)
+        if response.status_code != 200 or not response.content.startswith(b"RIFF"):
+            raise RuntimeError(f"audio.cpp: HTTP {response.status_code} {response.content[:300]!r}")
+        # `soundfile`, NOT `wave` — `wave` only knows PCM and fails on a float32 WAV.
+        audio, sr = sf.read(io.BytesIO(response.content), dtype="float32")
         if audio.ndim == 2:
             audio = audio.mean(axis=1)
         return audio, sr
@@ -225,65 +225,65 @@ class OmniVoiceBackend:
         seed: Optional[int] = None,
         instruct: Optional[str] = None,
     ):
-        """Kawalki dzwieku jako `np.float32` (mono 24 kHz) — tak jak u voxa:
-        `response_format=pcm` + `stream_format=audio`, float32 LE przy naglowku
-        `X-Sample-Format: f32`, inaczej s16le."""
+        """Audio chunks as `np.float32` (mono 24 kHz) — like Vox:
+        `response_format=pcm` + `stream_format=audio`, float32 LE with the
+        `X-Sample-Format: f32` header, s16le otherwise."""
         await self.load_model()
-        adres = self._serwer
-        zad = self._zadanie(text, voice_prompt, language, seed, instruct)
-        zad["response_format"] = "pcm"
-        zad["stream_format"] = "audio"
+        engine = self._engine
+        request = self._request(text, voice_prompt, language, seed, instruct)
+        request["response_format"] = "pcm"
+        request["stream_format"] = "audio"
 
-        # BEZ LIMITU — jak u voxa (pelna kolejka gubila KONIEC i wieszala generacje).
-        kolejka: asyncio.Queue = asyncio.Queue()
-        petla = asyncio.get_running_loop()
-        KONIEC = object()
+        # NO LIMIT — like Vox (a full queue lost the END and hung the generation).
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        END = object()
 
-        def pobieraj():
+        def fetch():
             import requests
 
-            reszta = b""
+            rest = b""
             try:
-                with requests.post(adres.rstrip("/") + "/v1/audio/speech",
-                                   json=zad, stream=True, timeout=900) as odp:
-                    if odp.status_code != 200:
-                        raise RuntimeError(f"audio.cpp: HTTP {odp.status_code} {odp.text[:300]}")
-                    f32 = odp.headers.get("X-Sample-Format") == "f32"
-                    bajtow = 4 if f32 else 2
-                    for blok in odp.iter_content(chunk_size=None):
-                        if not blok:
+                with requests.post(engine.rstrip("/") + "/v1/audio/speech",
+                                   json=request, stream=True, timeout=900) as response:
+                    if response.status_code != 200:
+                        raise RuntimeError(f"audio.cpp: HTTP {response.status_code} {response.text[:300]}")
+                    f32 = response.headers.get("X-Sample-Format") == "f32"
+                    width = 4 if f32 else 2
+                    for block in response.iter_content(chunk_size=None):
+                        if not block:
                             continue
-                        # probka nie moze sie przeciac miedzy blokami HTTP
-                        blok = reszta + blok
-                        uciete = len(blok) % bajtow
-                        reszta = blok[len(blok) - uciete:] if uciete else b""
-                        if uciete:
-                            blok = blok[:len(blok) - uciete]
-                        if not blok:
+                        # a sample must not be split between HTTP blocks
+                        block = rest + block
+                        cut = len(block) % width
+                        rest = block[len(block) - cut:] if cut else b""
+                        if cut:
+                            block = block[:len(block) - cut]
+                        if not block:
                             continue
                         if f32:
-                            probki = np.frombuffer(blok, dtype="<f4").copy()
+                            samples = np.frombuffer(block, dtype="<f4").copy()
                         else:
-                            probki = np.frombuffer(blok, dtype="<i2").astype(np.float32) / 32768.0
-                        petla.call_soon_threadsafe(kolejka.put_nowait, probki)
-            except Exception as blad:
-                petla.call_soon_threadsafe(kolejka.put_nowait, blad)
+                            samples = np.frombuffer(block, dtype="<i2").astype(np.float32) / 32768.0
+                        loop.call_soon_threadsafe(queue.put_nowait, samples)
+            except Exception as error:
+                loop.call_soon_threadsafe(queue.put_nowait, error)
             finally:
-                petla.call_soon_threadsafe(kolejka.put_nowait, KONIEC)
+                loop.call_soon_threadsafe(queue.put_nowait, END)
 
-        zadanie_watku = asyncio.create_task(asyncio.to_thread(pobieraj))
+        thread_task = asyncio.create_task(asyncio.to_thread(fetch))
         try:
             while True:
-                pozycja = await kolejka.get()
-                if pozycja is KONIEC:
+                item = await queue.get()
+                if item is END:
                     break
-                if isinstance(pozycja, Exception):
-                    raise pozycja
-                yield pozycja
+                if isinstance(item, Exception):
+                    raise item
+                yield item
         finally:
-            await zadanie_watku
+            await thread_task
 
     @property
-    def _serwer(self) -> str:
-        """Adres silnika audio.cpp (`VOXCPM_SERWER`) — wspolny z voxem."""
-        return os.environ.get("VOXCPM_SERWER", "").strip()
+    def _engine(self) -> str:
+        """The audio.cpp engine address (`AUDIOCPP_ENGINE`) — shared with Vox."""
+        return os.environ.get("AUDIOCPP_ENGINE", "http://audiocpp:17496").strip()

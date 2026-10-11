@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "echo '\u26d4 NIE TU. Front buduje sie w web/ \u2014 app/ nie ma PlatformProvider i daje biala strone.' >&2; exit 1",
+    "build": "echo '\u26d4 NOT HERE. The frontend builds in web/ \u2014 app/ has no PlatformProvider and gives a blank page.' >&2; exit 1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "preview": "vite preview",
     "lint": "biome lint src",

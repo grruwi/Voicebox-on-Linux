@@ -85,9 +85,9 @@ class GenerationRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0)
     model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B|1B|3B)$")
     instruct: Optional[str] = Field(None, max_length=500)
-    engine: Optional[str] = Field(default="voxcpm", pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|voxcpm|voxcpm_pt|fish_s2|fish_s1|fish_s2_pt|supertonic|omnivoice)$")
-    # Nadpisuje glos wbudowany zapisany w profilu preset — bez tego kazdy glos
-    # wymagalby osobnego profilu. Puste = zostaje ten z profilu.
+    engine: Optional[str] = Field(default="voxcpm", pattern="^(voxcpm|voxcpm_pt|omnivoice)$")
+    # Overrides the built-in voice stored in a preset profile — without it every voice
+    # would need a profile of its own. Empty = the profile's one stays.
     preset_voice_id: Optional[str] = Field(None, max_length=100)
     personality: bool = Field(
         default=False,
@@ -298,44 +298,46 @@ class GenerationSettingsResponse(BaseModel):
     autoplay_on_generate: bool = True
     vox_cfg: float = Field(default=2.0, ge=0.5, le=5.0)
     vox_timesteps: int = Field(default=10, ge=4, le=60)
-    # Temperatura szumu w dyfuzji. Silnik ma 1.0; nizej = powtarzalniej
-    # i plasko, wyzej = zywiej i bardziej losowo.
+    # Noise temperature in the diffusion. The engine uses 1.0; lower = more repeatable
+    # and flat, higher = livelier and more random.
     vox_temperature: float = Field(default=1.0, ge=0.1, le=2.0)
-    # None = ziarno losowe przy każdej generacji (tak ma być domyślnie).
+    # None = a random seed on every generation (that is the intended default).
     vox_seed: Optional[int] = Field(default=None, ge=0)
-    # Kwantyzacja wag — dwa niezależne pliki. Akustyka NIE MA wariantu q8.
-    vox_base_lm: str = Field(default="q8", pattern="^(q8|f16|f32)$")
-    vox_akustyka: str = Field(default="f16", pattern="^(f16|f32)$")
-    # Backend silnika audio.cpp: hip (ROCm 10, bin-docker) | vulkan (RADV, bin-docker-vulkan).
+    # Weight precision — two independent fields. The acoustic part has NO q8 variant.
+    vox_base_lm: str = Field(default="q8", pattern="^(q8|f16)$")  # f32 cut 11.10 — grruwi's call
+    vox_acoustic: str = Field(default="f16", pattern="^(f16|f32)$")
+    # audio.cpp engine backend: hip (ROCm 10, bin-docker) | vulkan (RADV, bin-docker-vulkan).
     vox_backend: str = Field(default="vulkan", pattern="^(hip|vulkan)$")
-    # OmniVoice (audio.cpp, 10.10): gotowy GGUF z upstreamu — q8 (q8_0, domyslny upstreamu) | f16.
-    omni_wagi: str = Field(default="q8", pattern="^(q8|f16)$")
-    # OmniVoice ma WLASNE suwaki (zakladka OmniVoice, 11.10). None = default upstreamu
-    # (guidance 2,0, 32 kroki, ziarno losowe). Flash attention: decyzja grruwiego
-    # „wszystko ma byc flash attention" — bez niego uwaga trzyma macierz T×T i VRAM puchnie.
+    # OmniVoice (audio.cpp, 10.10): a ready GGUF from upstream — q8 (q8_0, upstream's default) | f16.
+    omni_weights: str = Field(default="q8", pattern="^(q8|f16)$")
+    # OmniVoice has ITS OWN sliders (the OmniVoice tab, 11.10). None = upstream's default
+    # (guidance 2.0, 32 steps, a random seed). Flash attention: grruwi's call
+    # "everything has to be flash attention" — without it attention holds a T×T matrix and VRAM swells.
     omni_flash: bool = True
     omni_cfg: Optional[float] = Field(default=None, ge=0.5, le=5.0)
-    omni_kroki: Optional[int] = Field(default=None, ge=4, le=64)
+    omni_steps: Optional[int] = Field(default=None, ge=4, le=64)
     omni_seed: Optional[int] = Field(default=None, ge=0)
-    # Pseudo-strumien OmniVoice (jak `--stream-by-line` w omnivoice.cpp): tekst ciety na
-    # kawalki, kazdy liczony i wypuszczany osobno. brak = upstream (sam tnie > 30 s mowy);
-    # linie = `text_chunk_mode=endline`, zdania = `tag_aware`; znaki = `text_chunk_size`
-    # (None = 160, wartosc z przykladow strumienia w docs upstreamu).
-    omni_chunk_tryb: str = Field(default="brak", pattern="^(brak|linie|zdania)$")
-    omni_chunk_znaki: Optional[int] = Field(default=None, ge=10, le=2000)
-    # tempo mowy OmniVoice (`speed`, mnoznik do szacowania dlugosci); None = 1,0 upstreamu
-    omni_tempo: Optional[float] = Field(default=None, ge=0.5, le=2.0)
-    # Ziarnistość strumienia — w KROKACH dekodera, jeden krok to ~0,17 s dźwięku.
-    # min = cisza przed pierwszym słowem, co = wielkość kolejnych porcji.
+    # OmniVoice pseudo-stream (like `--stream-by-line` in omnivoice.cpp): the text is cut
+    # into chunks, each computed and sent separately. none = upstream (cuts by itself above
+    # 30 s of speech); lines = `text_chunk_mode=endline`, sentences = `tag_aware`; chars =
+    # `text_chunk_size` (None = 160, the value from upstream's stream examples).
+    omni_chunk_mode: str = Field(default="none", pattern="^(none|lines|sentences)$")
+    omni_chunk_chars: Optional[int] = Field(default=None, ge=10, le=2000)
+    # OmniVoice speech rate (`speed`, a multiplier for the length estimate); None = upstream's 1.0
+    omni_speed: Optional[float] = Field(default=None, ge=0.5, le=2.0)
+    # Stream granularity — in decoder STEPS, one step is ~0.17 s of sound.
+    # min = silence before the first word, every = the size of the next portions.
     vox_stream_min: int = Field(default=12, ge=1, le=64)
-    vox_stream_co: int = Field(default=16, ge=1, le=64)
-    # Whisper (whisper.cpp) — model dyktafonu, kwantyzacja, karta albo procesor.
+    vox_stream_every: int = Field(default=16, ge=1, le=64)
+    # Whisper (whisper.cpp) — the dictation model, quantization, GPU or CPU.
     whisper_model: str = Field(default="large", pattern="^(medium|large|turbo)$")
-    whisper_kwant: str = Field(default="q5", pattern="^(q5|q8)$")
-    whisper_urzadzenie: str = Field(default="gpu", pattern="^(gpu|cpu)$")
-    whisper_przy_starcie: bool = False
-    # flash attention whisper-servera (`-nfa` gdy False); domyslnie tak, jak whisper.cpp
+    whisper_quant: str = Field(default="q5", pattern="^(q5|q8)$")
+    whisper_device: str = Field(default="gpu", pattern="^(gpu|cpu)$")
+    whisper_on_startup: bool = False
+    # whisper-server flash attention (`-nfa` when False); on by default, like whisper.cpp
     whisper_fa: bool = True
+    # True = the Offloader is off, models of different engines may share the card.
+    keep_all_models: bool = False
 
     class Config:
         from_attributes = True
@@ -351,29 +353,30 @@ class GenerationSettingsUpdate(BaseModel):
     vox_cfg: Optional[float] = Field(default=None, ge=0.5, le=5.0)
     vox_timesteps: Optional[int] = Field(default=None, ge=4, le=60)
     vox_temperature: Optional[float] = Field(default=None, ge=0.1, le=2.0)
-    # ⚠️ `null` tutaj ZNACZY coś innego niż przy pozostałych polach: to nie
-    # „zostaw jak jest", tylko „wróć do losowego ziarna". Rozróżnia je
-    # `exclude_unset=True` w trasie — pole niewysłane w ogóle nie trafia do patcha.
+    # ⚠️ `null` here MEANS something else than for the other fields: not "leave it as
+    # it is", but "go back to a random seed". `exclude_unset=True` in the route tells
+    # them apart — a field that was not sent never gets into the patch.
     vox_seed: Optional[int] = Field(default=None, ge=0)
     vox_base_lm: Optional[str] = Field(default=None, pattern="^(q8|f16|f32)$")
-    vox_akustyka: Optional[str] = Field(default=None, pattern="^(f16|f32)$")
+    vox_acoustic: Optional[str] = Field(default=None, pattern="^(f16|f32)$")
     vox_backend: Optional[str] = Field(default=None, pattern="^(hip|vulkan)$")
-    omni_wagi: Optional[str] = Field(default=None, pattern="^(q8|f16)$")
+    omni_weights: Optional[str] = Field(default=None, pattern="^(q8|f16)$")
     omni_flash: Optional[bool] = None
     omni_cfg: Optional[float] = Field(default=None, ge=0.5, le=5.0)
-    omni_kroki: Optional[int] = Field(default=None, ge=4, le=64)
+    omni_steps: Optional[int] = Field(default=None, ge=4, le=64)
     omni_seed: Optional[int] = Field(default=None, ge=0)
-    omni_chunk_tryb: Optional[str] = Field(default=None, pattern="^(brak|linie|zdania)$")
-    omni_chunk_znaki: Optional[int] = Field(default=None, ge=10, le=2000)
-    # tempo mowy OmniVoice (`speed`, mnoznik do szacowania dlugosci); None = 1,0 upstreamu
-    omni_tempo: Optional[float] = Field(default=None, ge=0.5, le=2.0)
+    omni_chunk_mode: Optional[str] = Field(default=None, pattern="^(none|lines|sentences)$")
+    omni_chunk_chars: Optional[int] = Field(default=None, ge=10, le=2000)
+    # OmniVoice speech rate (`speed`, a multiplier for the length estimate); None = upstream's 1.0
+    omni_speed: Optional[float] = Field(default=None, ge=0.5, le=2.0)
     vox_stream_min: Optional[int] = Field(default=None, ge=1, le=64)
-    vox_stream_co: Optional[int] = Field(default=None, ge=1, le=64)
+    vox_stream_every: Optional[int] = Field(default=None, ge=1, le=64)
     whisper_model: Optional[str] = Field(default=None, pattern="^(medium|large|turbo)$")
-    whisper_kwant: Optional[str] = Field(default=None, pattern="^(q5|q8)$")
-    whisper_urzadzenie: Optional[str] = Field(default=None, pattern="^(gpu|cpu)$")
-    whisper_przy_starcie: Optional[bool] = None
+    whisper_quant: Optional[str] = Field(default=None, pattern="^(q5|q8)$")
+    whisper_device: Optional[str] = Field(default=None, pattern="^(gpu|cpu)$")
+    whisper_on_startup: Optional[bool] = None
     whisper_fa: Optional[bool] = None
+    keep_all_models: Optional[bool] = None
 
 
 class MCPClientBindingResponse(BaseModel):
@@ -386,7 +389,7 @@ class MCPClientBindingResponse(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|voxcpm|voxcpm_pt|fish_s2|fish_s1|fish_s2_pt|supertonic|omnivoice)$",
+        pattern="^(voxcpm|voxcpm_pt|omnivoice)$",
     )
     default_personality: bool = False
     last_seen_at: Optional[datetime] = None
@@ -405,7 +408,7 @@ class MCPClientBindingUpsert(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|voxcpm|voxcpm_pt|fish_s2|fish_s1|fish_s2_pt|supertonic|omnivoice)$",
+        pattern="^(voxcpm|voxcpm_pt|omnivoice)$",
     )
     default_personality: bool = False
 
@@ -424,7 +427,7 @@ class SpeakRequest(BaseModel):
     )
     engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|voxcpm|voxcpm_pt|fish_s2|fish_s1|fish_s2_pt|supertonic|omnivoice)$",
+        pattern="^(voxcpm|voxcpm_pt|omnivoice)$",
     )
     personality: Optional[bool] = Field(
         None,

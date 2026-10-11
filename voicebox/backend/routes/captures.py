@@ -7,8 +7,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
-from ..backends import get_llm_model_configs, get_stt_model_configs
-from ..backends.base import is_model_cached
+from ..backends import get_stt_model_configs
 from ..database import Capture as DBCapture, get_db
 from ..services import captures as captures_service
 from ..services import settings as settings_service
@@ -163,39 +162,37 @@ async def capture_readiness_endpoint(db: Session = Depends(get_db)):
     waits forever for a download to finish. Checks on-disk cache, not RAM
     load, so the answer survives backend restarts.
     """
-    saved = settings_service.get_capture_settings(db)
+    # This build: whisper.cpp weights on disk (never downloaded by Voicebox) and an
+    # LLM in LM Studio (its model, nothing to download here).
+    from ..backends import get_stt_backend
 
+    saved = settings_service.get_capture_settings(db)
     stt_cfg = next(
         (c for c in get_stt_model_configs() if c.model_size == saved.stt_model),
         None,
     )
-    llm_cfg = next(
-        (c for c in get_llm_model_configs() if c.model_size == saved.llm_model),
-        None,
-    )
+    if stt_cfg is None:
+        raise HTTPException(status_code=500, detail=f"No model config for stt={saved.stt_model}")
 
-    if stt_cfg is None or llm_cfg is None:
-        # Should be impossible — both fields are pattern-validated against
-        # known sizes — but bail loudly rather than return half a response.
-        raise HTTPException(
-            status_code=500,
-            detail=f"No model config for stt={saved.stt_model} or llm={saved.llm_model}",
-        )
+    try:
+        stt_ready = bool(get_stt_backend()._is_model_cached(stt_cfg.model_size))
+    except Exception:
+        stt_ready = False
 
     return models.CaptureReadinessResponse(
         stt=models.ModelReadiness(
-            ready=is_model_cached(stt_cfg.hf_repo_id),
+            ready=stt_ready,
             model_name=stt_cfg.model_name,
             display_name=stt_cfg.display_name,
             size=stt_cfg.model_size,
             size_mb=stt_cfg.size_mb or None,
         ),
         llm=models.ModelReadiness(
-            ready=is_model_cached(llm_cfg.hf_repo_id),
-            model_name=llm_cfg.model_name,
-            display_name=llm_cfg.display_name,
-            size=llm_cfg.model_size,
-            size_mb=llm_cfg.size_mb or None,
+            ready=True,
+            model_name="lmstudio",
+            display_name="LM Studio",
+            size=saved.llm_model,
+            size_mb=None,
         ),
     )
 

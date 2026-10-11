@@ -1,22 +1,22 @@
-# OPCJONALNY wariant ROCm — NIE jest potrzebny, Vulkan dziala na kazdej karcie.
-# Tylko Radeony: dokłada binarke HIP (ROCm 10, TheRock) obok Vulkana, a przelacznik
-# siedzi w panelu (Ustawienia → Ogolne → Backend). Build pobiera ~2,4 GB ROCm na
-# rodzine kart i kompiluje dluzej.
+# OPTIONAL ROCm variant of the audio.cpp engine — NOT needed, Vulkan runs on any card.
+# Radeons only: adds a HIP binary (ROCm 10, TheRock) next to the Vulkan one; the switch
+# lives in the panel (Generation → General → Backend). Compiled for specific GPUs:
+# every extra card = a longer build and ~0.5 GB more, plus ~2.4 GB of ROCm per family.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
-# albo na stale w .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.rocm.yml
+# or for good in .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.rocm.yml
 
 services:
   audiocpp:
     build:
       target: rocm
-      # Domyslnie RX 9000 + RX 7000. Inne karty — rodziny z
-      # https://rocm.prereleases.amd.com/tarball-multi-arch/ i ich gfx:
+      # Default: RX 9000 + RX 7000. Other cards — families from
+      # https://rocm.prereleases.amd.com/tarball-multi-arch/ and their gfx:
       # args:
-      #   ROCM_RODZINY: "gfx103X-all"
+      #   ROCM_FAMILIES: "gfx103X-all"
       #   GPU_TARGETS: "gfx1030"
     devices:
       - /dev/kfd:/dev/kfd
-    # domyslny profil seccomp Dockera blokuje czesc syscalli kolejek HSA
+    # Docker's default seccomp profile blocks some syscalls of the HSA queues
     security_opt:
       - seccomp:unconfined

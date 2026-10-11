@@ -273,29 +273,29 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
     return {"message": "Generation cancellation requested"}
 
 
-# ⭐ STRUMIEN DO PRZEGLADARKI (11.10) — „autoplay on generate" zaznaczony: panel gra kawalki
-# w miare liczenia (`services/strumien_przegladarki.py`). 204 = ta generacja nie idzie
-# strumieniem (odznaczony autoplay → ffplay, za dlugi tekst, efekty, retry) — panel gra plik.
-@router.get("/generate/{generation_id}/strumien")
-async def strumien_przegladarki_endpoint(generation_id: str, db: Session = Depends(get_db)):
-    """4 bajty czestotliwosci (uint32 LE) + surowe f32le mono, w miare liczenia."""
+# ⭐ THE STREAM TO THE BROWSER (11.10) — "autoplay on generate" checked: the panel plays the
+# chunks as they are made (`services/browser_stream.py`). 204 = this generation is not
+# streamed (autoplay unchecked → ffplay, text too long, effects, retry) — the panel plays the file.
+@router.get("/generate/{generation_id}/browser-stream")
+async def browser_stream_endpoint(generation_id: str, db: Session = Depends(get_db)):
+    """4 bytes of sample rate (uint32 LE) + raw f32le mono, as it is computed."""
     import time
 
     from fastapi import Response
-    from ..services import strumien_przegladarki
+    from ..services import browser_stream
 
-    # Generacja moze stac w kolejce za inna — czekamy na decyzje `run_generation`.
-    termin = time.monotonic() + 600
-    nastepny_odczyt_bazy = 0.0
+    # The generation may wait in the queue behind another — wait for `run_generation`'s decision.
+    deadline = time.monotonic() + 600
+    next_db_read = 0.0
     while True:
-        znana, strumien = strumien_przegladarki.pobierz(generation_id)
-        if znana:
+        decided, stream = browser_stream.get(generation_id)
+        if decided:
             break
-        teraz = time.monotonic()
-        if teraz > termin:
+        now = time.monotonic()
+        if now > deadline:
             return Response(status_code=204)
-        if teraz >= nastepny_odczyt_bazy:
-            nastepny_odczyt_bazy = teraz + 0.25
+        if now >= next_db_read:
+            next_db_read = now + 0.25
             db.expire_all()
             status = db.query(DBGeneration.status).filter_by(id=generation_id).scalar()
             if status is None and not db.query(DBGeneration.id).filter_by(id=generation_id).first():
@@ -304,10 +304,10 @@ async def strumien_przegladarki_endpoint(generation_id: str, db: Session = Depen
                 return Response(status_code=204)
         await asyncio.sleep(0.02)
 
-    if strumien is None:
+    if stream is None:
         return Response(status_code=204)
     return StreamingResponse(
-        strumien.czytaj(),
+        stream.read(),
         media_type="application/octet-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

@@ -41,20 +41,9 @@ export type LanguageCode = keyof typeof ALL_LANGUAGES;
 export const ENGINE_LANGUAGES: Record<string, readonly LanguageCode[]> = {
   qwen: ['zh', 'en', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it'],
   voxcpm: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
-  // OmniVoice zna 600+ jezykow — tu te, ktore zna GUI (`ALL_LANGUAGES`), jak u voxa.
+  // OmniVoice knows 600+ languages — here the ones the GUI knows (`ALL_LANGUAGES`), as for Vox.
   omnivoice: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
-  fish_s2: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
-  fish_s1: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
-  // Model umie 31 jezykow; tutaj stoi 19 — te, ktore zna GUI (`ALL_LANGUAGES`).
-  // Poza lista zostaly: bg, cs, et, hr, hu, id, lt, lv, ro, sk, sl, uk, vi —
-  // backend je przyjmie, wiec przez API/MCP dzialaja; brakuje im tylko pozycji
-  // w selektorze. Dopisanie ich do `ALL_LANGUAGES` dotyka WSZYSTKICH silnikow.
-  supertonic: [
-    'pl', 'en', 'ko', 'ja', 'ar', 'da', 'de', 'el', 'es', 'fi',
-    'fr', 'hi', 'it', 'nl', 'pt', 'ru', 'sv', 'tr',
-  ],
   voxcpm_pt: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
-  fish_s2_pt: ['pl', 'en', 'zh', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it', 'ar', 'nl', 'tr'],
   luxtts: ['en'],
   chatterbox: [
     'ar',

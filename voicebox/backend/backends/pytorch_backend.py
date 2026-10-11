@@ -4,7 +4,6 @@ PyTorch backend implementation for TTS and STT.
 
 from typing import Optional, List, Tuple
 import asyncio
-import gc
 import logging
 import torch
 import numpy as np
@@ -249,14 +248,7 @@ class PyTorchTTSBackend:
 class PyTorchSTTBackend:
     """PyTorch-based STT backend using Whisper."""
 
-    # ⛔ DOMYSLNY: base -> medium -> "turbo" (16.08). Base i small nie czaja
-    # polskiego, a medium jest wolne i wazy 3 GB. Ten domyslny NIE jest martwy:
-    # `services/captures.py` robi `stt_model or whisper.model_size`, wiec kazda
-    # droga, ktora nie poda modelu jawnie, laduje wlasnie TU — i ciagnie go z
-    # sieci, nawet gdy w bazie (capture_settings.stt_model) stoi turbo.
-    # Patrz tez WHISPER_HF_REPOS w backends/__init__.py, skad base i small
-    # zostaly usuniete.
-    def __init__(self, model_size: str = "turbo"):
+    def __init__(self, model_size: str = "base"):
         self.model = None
         self.processor = None
         self.model_size = model_size
@@ -287,13 +279,6 @@ class PyTorchSTTBackend:
         if self.model is not None and self.model_size == model_size:
             return
 
-        # Drop the previous size before pulling in the next one. Without this the
-        # old weights stay in the allocator's cache while the new ones load, so
-        # switching whisper-base -> whisper-turbo held both in VRAM at once.
-        # TADA's backend already does this; whisper was the one that didn't.
-        if self.model is not None:
-            self.unload_model()
-
         await asyncio.to_thread(self._load_model_sync, model_size)
 
     # Alias for compatibility
@@ -311,16 +296,7 @@ class PyTorchSTTBackend:
             logger.info("Loading Whisper model %s on %s...", model_size, self.device)
 
             self.processor = WhisperProcessor.from_pretrained(model_name)
-            # ⚠️ `dtype` JAWNIE (16.08). Pliki na HF sa fp16 (zweryfikowane w
-            # naglowku safetensors: 587 tensorow F16, 1543 MB), ale transformers
-            # 4.57 bez tego argumentu bierze `torch.get_default_dtype()` i
-            # ROZDMUCHUJE je do fp32 — zmierzone 3086 MB wag w pamieci.
-            # grruwi swiadomie godzi sie na strate precyzji: "przy dzwieku to ma
-            # wieksze znaczenie niz przy tekscie" — wiec jesli transkrypcja
-            # zacznie gubic koncowki, TO JEST PIERWSZE PODEJRZANE.
-            self.model = WhisperForConditionalGeneration.from_pretrained(
-                model_name, dtype=torch.float16
-            )
+            self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
         self.model.to(self.device)
         self.model_size = model_size
@@ -334,11 +310,6 @@ class PyTorchSTTBackend:
             self.model = None
             self.processor = None
 
-            # ⚠️ `del` zdejmuje tylko NAZWE. Model HF ma cykle referencji, wiec
-            # wagi zyja do najblizszego przebiegu GC, a `empty_cache()` widzi
-            # je jako zajete i nie oddaje karty. Zmierzone 01.09 na large-v3:
-            # samo `del` -> 6,29 GB, po `gc.collect()` -> 3,54 GB (2,75 GB roznicy).
-            gc.collect()
             empty_device_cache(self.device)
 
             logger.info("Whisper model unloaded")
@@ -348,7 +319,6 @@ class PyTorchSTTBackend:
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
-        prompt: Optional[str] = None,
     ) -> str:
         """
         Transcribe audio to text.
@@ -373,61 +343,22 @@ class PyTorchSTTBackend:
             # whose `get_decoder_prompt_ids` / tokenizer calls issue
             # legitimate metadata lookups.
             # Process audio
-            # ⚠️ Bez `truncation=False` feature extractor OBCINA wejscie do 30 s
-            # i reszta przepada BEZ BLEDU. Zmierzone 01.09: 90 s nagrania dalo
-            # 364 znaki — tyle samo, co pierwsze 29 s. `padding="longest"`
-            # zostawia dluzsze wejscie w calosci, a wtedy transformers wchodzi
-            # SAM w tryb sequential (rolling window: okno 30 s przesuwa sie i
-            # przekazuje kontekst dalej).
             inputs = self.processor(
                 audio,
                 sampling_rate=16000,
                 return_tensors="pt",
-                truncation=False,
-                padding="longest",
-                return_attention_mask=True,
             )
-            # ⛔ Ponizej 30 s enkoder DALEJ wymaga dokladnie 3000 ramek, wiec
-            # krotkie nagranie trzeba dopelnic po staremu.
-            if inputs["input_features"].shape[-1] < 3000:
-                inputs = self.processor(
-                    audio,
-                    sampling_rate=16000,
-                    return_tensors="pt",
-                    return_attention_mask=True,
-                )
-            # dtype MUSI isc za modelem — po przejsciu na fp16 samo `.to(device)`
-            # zostawia wejscie w fp32 i encoder wywala "expected scalar type Half".
-            # BatchFeature konwertuje tylko tensory zmiennoprzecinkowe.
-            inputs = inputs.to(self.device, dtype=self.model.dtype)
+            inputs = inputs.to(self.device)
 
             # Generate transcription
             # If language is provided, force it; otherwise let Whisper auto-detect
-            # ⛔ `forced_decoder_ids` jest PRZESTARZALE i BLOKUJE tryb sequential —
-            # transformers 4.57 chce `language`/`task` wprost. Zostawione tu bylo
-            # powodem, dla ktorego dlugie nagrania nie przechodzily przez okna.
             generate_kwargs = {}
             if language:
-                generate_kwargs["language"] = language
-                generate_kwargs["task"] = "transcribe"
-            if "attention_mask" in inputs:
-                generate_kwargs["attention_mask"] = inputs["attention_mask"]
-            # ⛔ Powyzej 3000 ramek (30 s) transformers wchodzi w tryb dlugi i
-            # WYMAGA znacznikow czasu, inaczej rzuca ValueError. To one sklejaja
-            # kolejne okna w jeden ciag — bez nich model nie wie, gdzie skonczyl.
-            if inputs["input_features"].shape[-1] > 3000:
-                generate_kwargs["return_timestamps"] = True
-            if prompt:
-                # Nazwy wlasne jako kontekst POPRZEDZAJACY nagranie — model
-                # chetniej pisze "Klodzio" niz "Klaudio". To odpowiednik
-                # `initial_prompt` z whisper.cpp.
-                # ⚠️ Okno promptu to ~224 tokeny; dluzszy tekst transformers
-                # utnie od POCZATKU, wiec wazne nazwy trzymaj z przodu.
-                generate_kwargs["prompt_ids"] = self.processor.get_prompt_ids(
-                    prompt, return_tensors="pt"
-                ).to(self.device)
-                # ⛔ Bez tego prompt wypada W TRANSKRYPCJI jako pierwsze zdanie.
-                generate_kwargs["prompt_condition_type"] = "first-segment"
+                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                    language=language,
+                    task="transcribe",
+                )
+                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
 
             with torch.no_grad():
                 predicted_ids = self.model.generate(

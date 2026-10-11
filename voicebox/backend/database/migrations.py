@@ -247,110 +247,74 @@ def _migrate_capture_settings(engine, inspector, tables: set[str]) -> None:
 
 
 def _migrate_generation_settings(engine, inspector, tables: set[str]) -> None:
-    """Pokretla VoxCPM2 wystawione do GUI.
+    """VoxCPM2, OmniVoice and whisper knobs exposed in the GUI.
 
-    ⚠️ Bez tej migracji objaw jest CICHY: `create_all` nie dokłada kolumn do
-    istniejącej tabeli, a `_pokretla()` w `voxcpm_gguf_backend` łapie wyjątek
-    i spada na zmienne środowiskowe — czyli GUI wygląda na zepsute, a w logu
-    nie ma ani jednej linii błędu.
+    ⚠️ Without this migration the symptom is SILENT: `create_all` does not add columns
+    to an existing table, and the engines catch the exception and fall back to env
+    variables — so the GUI looks broken and the log has not a single error line.
 
-    `vox_cfg` i `vox_timesteps` są tu razem z `vox_seed`, bo w bazach założonych
-    przed 16.08 ich nie ma i do tej pory ratował je wyłącznie ten cichy wyjątek.
+    Columns that had Polish names are renamed in place (values kept); the chunk mode
+    values are translated too. Then whatever is still missing is added.
     """
     if "generation_settings" not in tables:
         return
     columns = _get_columns(inspector, "generation_settings")
-    if "vox_cfg" not in columns:
-        _add_column(engine, "generation_settings", "vox_cfg REAL NOT NULL DEFAULT 2.0", "vox_cfg")
-    if "vox_timesteps" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_timesteps INTEGER NOT NULL DEFAULT 10",
-            "vox_timesteps",
-        )
-    if "vox_temperature" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_temperature REAL NOT NULL DEFAULT 1.0",
-            "vox_temperature",
-        )
-    # Bez DEFAULT i bez NOT NULL — NULL znaczy „ziarno losowe za każdym razem".
-    if "vox_seed" not in columns:
-        _add_column(engine, "generation_settings", "vox_seed INTEGER", "vox_seed")
-    if "vox_base_lm" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_base_lm TEXT NOT NULL DEFAULT 'q8'",
-            "vox_base_lm",
-        )
-    if "vox_akustyka" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_akustyka TEXT NOT NULL DEFAULT 'f16'",
-            "vox_akustyka",
-        )
-    if "vox_backend" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_backend TEXT NOT NULL DEFAULT 'vulkan'",
-            "vox_backend",
-        )
-    if "omni_wagi" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "omni_wagi TEXT NOT NULL DEFAULT 'q8'",
-            "omni_wagi",
-        )
-    if "omni_flash" not in columns:
-        _add_column(engine, "generation_settings", "omni_flash BOOLEAN NOT NULL DEFAULT 1", "omni_flash")
-    if "omni_chunk_tryb" not in columns:
-        _add_column(engine, "generation_settings", "omni_chunk_tryb TEXT NOT NULL DEFAULT 'brak'", "omni_chunk_tryb")
-    for kolumna, typ in (("omni_cfg", "REAL"), ("omni_kroki", "INTEGER"), ("omni_seed", "INTEGER"),
-                         ("omni_chunk_znaki", "INTEGER"), ("omni_tempo", "REAL")):
-        if kolumna not in columns:
-            _add_column(engine, "generation_settings", f"{kolumna} {typ}", kolumna)
-    if "vox_stream_min" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_stream_min INTEGER NOT NULL DEFAULT 12",
-            "vox_stream_min",
-        )
-    if "vox_stream_co" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "vox_stream_co INTEGER NOT NULL DEFAULT 16",
-            "vox_stream_co",
-        )
-    for kolumna, domyslnie in (
-        ("whisper_model", "large"),
-        ("whisper_kwant", "q5"),
-        ("whisper_urzadzenie", "gpu"),
-    ):
-        if kolumna not in columns:
-            _add_column(
-                engine,
-                "generation_settings",
-                f"{kolumna} TEXT NOT NULL DEFAULT '{domyslnie}'",
-                kolumna,
-            )
-    if "whisper_przy_starcie" not in columns:
-        _add_column(
-            engine,
-            "generation_settings",
-            "whisper_przy_starcie BOOLEAN NOT NULL DEFAULT 0",
-            "whisper_przy_starcie",
-        )
-    if "whisper_fa" not in columns:
-        _add_column(engine, "generation_settings", "whisper_fa BOOLEAN NOT NULL DEFAULT 1", "whisper_fa")
 
+    renames = (
+        ("vox_akustyka", "vox_acoustic"),
+        ("omni_wagi", "omni_weights"),
+        ("omni_kroki", "omni_steps"),
+        ("omni_chunk_tryb", "omni_chunk_mode"),
+        ("omni_chunk_znaki", "omni_chunk_chars"),
+        ("omni_tempo", "omni_speed"),
+        ("vox_stream_co", "vox_stream_every"),
+        ("whisper_kwant", "whisper_quant"),
+        ("whisper_urzadzenie", "whisper_device"),
+        ("whisper_przy_starcie", "whisper_on_startup"),
+        ("keep_engines_alive", "keep_all_models"),
+    )
+    with engine.connect() as conn:
+        for old, new in renames:
+            if old in columns and new not in columns:
+                conn.execute(text(f"ALTER TABLE generation_settings RENAME COLUMN {old} TO {new}"))
+                columns = (columns - {old}) | {new}
+                logger.info("Renamed generation_settings.%s to %s", old, new)
+        if "omni_chunk_mode" in columns:
+            conn.execute(text(
+                "UPDATE generation_settings SET omni_chunk_mode = CASE omni_chunk_mode "
+                "WHEN 'brak' THEN 'none' WHEN 'linie' THEN 'lines' WHEN 'zdania' THEN 'sentences' "
+                "ELSE omni_chunk_mode END"
+            ))
+        conn.commit()
+
+    for column, sql in (
+        ("vox_cfg", "REAL NOT NULL DEFAULT 2.0"),
+        ("vox_timesteps", "INTEGER NOT NULL DEFAULT 10"),
+        ("vox_temperature", "REAL NOT NULL DEFAULT 1.0"),
+        # No DEFAULT and no NOT NULL — NULL means "a random seed every time".
+        ("vox_seed", "INTEGER"),
+        ("vox_base_lm", "TEXT NOT NULL DEFAULT 'q8'"),
+        ("vox_acoustic", "TEXT NOT NULL DEFAULT 'f16'"),
+        ("vox_backend", "TEXT NOT NULL DEFAULT 'vulkan'"),
+        ("omni_weights", "TEXT NOT NULL DEFAULT 'q8'"),
+        ("omni_flash", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("omni_chunk_mode", "TEXT NOT NULL DEFAULT 'none'"),
+        ("omni_cfg", "REAL"),
+        ("omni_steps", "INTEGER"),
+        ("omni_seed", "INTEGER"),
+        ("omni_chunk_chars", "INTEGER"),
+        ("omni_speed", "REAL"),
+        ("vox_stream_min", "INTEGER NOT NULL DEFAULT 12"),
+        ("vox_stream_every", "INTEGER NOT NULL DEFAULT 16"),
+        ("whisper_model", "TEXT NOT NULL DEFAULT 'large'"),
+        ("whisper_quant", "TEXT NOT NULL DEFAULT 'q5'"),
+        ("whisper_device", "TEXT NOT NULL DEFAULT 'gpu'"),
+        ("whisper_on_startup", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("whisper_fa", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("keep_all_models", "BOOLEAN NOT NULL DEFAULT 0"),
+    ):
+        if column not in columns:
+            _add_column(engine, "generation_settings", f"{column} {sql}", column)
 
 def _migrate_mcp_bindings(engine, inspector, tables: set[str]) -> None:
     """Drop the legacy ``default_intent`` column and add ``default_personality``.

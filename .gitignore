@@ -1,5 +1,6 @@
-modele/
-dane/
+/models/
+/data/
 .env
+docker-compose.override.yml
 __pycache__/
 node_modules/

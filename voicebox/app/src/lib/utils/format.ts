@@ -59,14 +59,10 @@ const ENGINE_DISPLAY_NAMES: Record<string, string> = {
   qwen: 'Qwen',
   voxcpm: 'VoxCPM2',
   omnivoice: 'OmniVoice',
-  fish_s2: 'Fish S2 Pro',
-  fish_s1: 'Fish S1-mini',
   voxcpm_pt: 'VoxCPM2 PyTorch',
-  fish_s2_pt: 'Fish S2 Pro PyTorch',
   luxtts: 'LuxTTS',
   chatterbox: 'Chatterbox',
   chatterbox_turbo: 'Chatterbox Turbo',
-  supertonic: 'Supertonic 3',
 };
 
 export function formatEngineName(engine?: string, modelSize?: string): string {

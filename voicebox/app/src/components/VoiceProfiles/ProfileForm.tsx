@@ -58,12 +58,12 @@ import { type ProfileFormDraft, useUIStore } from '@/stores/uiStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
-import { EdytorProbki } from './EdytorProbki';
+import { SampleEditor } from './SampleEditor';
 import { SampleList } from './SampleList';
 
 const MAX_AUDIO_DURATION_SECONDS = 30;
 const PRESET_ONLY_ENGINES = new Set(['kokoro', 'qwen_custom_voice']);
-// 11.10 (decyzja grruwiego): tylko vox (ggml), OmniVoice i vox PyTorch — reszta wycieta z listy.
+// Only the engines of this build: Vox (audio.cpp), OmniVoice and Vox (PyTorch).
 const DEFAULT_ENGINE_OPTIONS = [
   { value: 'voxcpm', label: 'VoxCPM2' },
   { value: 'omnivoice', label: 'OmniVoice' },
@@ -149,7 +149,7 @@ export function ProfileForm() {
   const [sampleMode, setSampleMode] = useState<'upload' | 'record' | 'system'>('record');
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
-  const [edytorOtwarty, setEdytorOtwarty] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [selectedPresetEngine, setSelectedPresetEngine] = useState<string>('kokoro');
   const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
@@ -985,7 +985,7 @@ export function ProfileForm() {
                                     isPlaying={isPlaying}
                                     isValidating={isValidatingAudio}
                                     isTranscribing={transcribe.isPending}
-                                    onEdit={() => setEdytorOtwarty(true)}
+                                    onEdit={() => setEditorOpen(true)}
                                     isDisabled={
                                       audioDuration !== null &&
                                       audioDuration > MAX_AUDIO_DURATION_SECONDS
@@ -1012,7 +1012,7 @@ export function ProfileForm() {
                                     onPlayPause={handlePlayPause}
                                     isPlaying={isPlaying}
                                     isTranscribing={transcribe.isPending}
-                                    onEdit={() => setEdytorOtwarty(true)}
+                                    onEdit={() => setEditorOpen(true)}
                                   />
                                 )}
                               />
@@ -1035,18 +1035,18 @@ export function ProfileForm() {
                                       onPlayPause={handlePlayPause}
                                       isPlaying={isPlaying}
                                       isTranscribing={transcribe.isPending}
-                                      onEdit={() => setEdytorOtwarty(true)}
+                                      onEdit={() => setEditorOpen(true)}
                                     />
                                   )}
                                 />
                               </TabsContent>
                             )}
                           </Tabs>
-                          <EdytorProbki
+                          <SampleEditor
                             file={selectedFile}
-                            open={edytorOtwarty}
-                            onOpenChange={setEdytorOtwarty}
-                            onApply={(plik) => form.setValue('sampleFile', plik, { shouldValidate: true })}
+                            open={editorOpen}
+                            onOpenChange={setEditorOpen}
+                            onApply={(file) => form.setValue('sampleFile', file, { shouldValidate: true })}
                           />
 
                           <FormField

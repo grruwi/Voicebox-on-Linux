@@ -19,14 +19,12 @@ def register_routers(app: FastAPI) -> None:
     from .models import router as models_router
     from .settings import router as settings_router
     from .tasks import router as tasks_router
-    from .cuda import router as cuda_router
-    from .rocm import router as rocm_router
     from .speak import router as speak_router
     from .mcp_bindings import router as mcp_bindings_router
     from .events import router as events_router
     from .cloud import router as cloud_router
     from .openai_compat import router as openai_compat_router
-    from .edytor import router as edytor_router
+    from .editor import router as editor_router
 
     app.include_router(health_router)
     app.include_router(profiles_router)
@@ -42,11 +40,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(models_router)
     app.include_router(settings_router)
     app.include_router(tasks_router)
-    app.include_router(cuda_router)
-    app.include_router(rocm_router)
     app.include_router(speak_router)
     app.include_router(mcp_bindings_router)
     app.include_router(events_router)
     app.include_router(cloud_router)
     app.include_router(openai_compat_router)
-    app.include_router(edytor_router)
+    app.include_router(editor_router)

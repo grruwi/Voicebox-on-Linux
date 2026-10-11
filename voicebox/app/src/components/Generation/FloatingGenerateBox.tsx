@@ -24,6 +24,7 @@ import { cn } from '@/lib/utils/cn';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 import { useUIStore } from '@/stores/uiStore';
+import type { TtsEngine } from '@/lib/api/types';
 import { EngineModelSelector } from './EngineModelSelector';
 import { ParalinguisticInput } from './ParalinguisticInput';
 
@@ -144,21 +145,7 @@ export function FloatingGenerateBox({
   }, [watchedEngine, setSelectedEngine]);
 
   // Sync generation form language, engine, and effects with selected profile
-  type EngineValue =
-    | 'qwen'
-    | 'voxcpm'
-    | 'omnivoice'
-    | 'voxcpm_pt'
-    | 'fish_s2_pt'
-    | 'fish_s2'
-    | 'fish_s1'
-    | 'supertonic'
-    | 'luxtts'
-    | 'chatterbox'
-    | 'chatterbox_turbo'
-    | 'tada'
-    | 'kokoro'
-    | 'qwen_custom_voice';
+  type EngineValue = TtsEngine;
   useEffect(() => {
     if (selectedProfile?.language) {
       form.setValue('language', selectedProfile.language as LanguageCode);
@@ -167,13 +154,6 @@ export function FloatingGenerateBox({
     const engine = selectedProfile?.default_engine ?? selectedProfile?.preset_engine;
     if (engine) {
       form.setValue('engine', engine as EngineValue);
-    } else if (selectedProfile && selectedProfile.voice_type !== 'preset') {
-      // Cloned/designed profile with no default — ensure a compatible (non-preset) engine
-      const currentEngine = form.getValues('engine');
-      const presetEngines = new Set(['kokoro', 'qwen_custom_voice']);
-      if (currentEngine && presetEngines.has(currentEngine)) {
-        form.setValue('engine', 'qwen');
-      }
     }
     // Pre-fill effects from profile defaults
     if (
@@ -299,7 +279,7 @@ export function FloatingGenerateBox({
                           transition={{ duration: 0.15, ease: 'easeOut' }}
                           style={{ overflow: 'hidden' }}
                         >
-                          {form.watch('engine') === 'chatterbox_turbo' ? (
+                          {(form.watch('engine') as string | undefined) === 'chatterbox_turbo' ? (
                             <ParalinguisticInput
                               value={field.value}
                               onChange={field.onChange}
@@ -445,7 +425,7 @@ export function FloatingGenerateBox({
 
                 {/* Instruct toggle — only for Qwen CustomVoice, which actually honors the kwarg */}
                 <AnimatePresence>
-                  {isExpanded && form.watch('engine') === 'qwen_custom_voice' && (
+                  {isExpanded && (form.watch('engine') as string | undefined) === 'qwen_custom_voice' && (
                     <motion.div
                       initial={{ opacity: 0, scale: 0.8 }}
                       animate={{ opacity: 1, scale: 1 }}
@@ -514,7 +494,7 @@ export function FloatingGenerateBox({
 
             {/* Additive instruct textarea — shown below main text when toggle is on and engine supports it */}
             <AnimatePresence>
-              {isInstructExpanded && form.watch('engine') === 'qwen_custom_voice' && (
+              {isInstructExpanded && (form.watch('engine') as string | undefined) === 'qwen_custom_voice' && (
                 <motion.div
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: 'auto' }}

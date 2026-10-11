@@ -9,7 +9,7 @@ import { ProfileCard } from './ProfileCard';
 import { ProfileForm } from './ProfileForm';
 
 /** Engines that use preset (built-in) voices instead of cloned profiles. */
-const PRESET_ENGINES = new Set(['kokoro', 'qwen_custom_voice', 'supertonic']);
+const PRESET_ENGINES = new Set<string>([]); // none of this build's engines ships preset voices
 
 export function ProfileList() {
   const { t } = useTranslation();

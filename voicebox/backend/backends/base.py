@@ -134,9 +134,9 @@ def check_cuda_compatibility() -> tuple[bool, str | None]:
         (compatible, warning_message) — compatible is True if OK or no CUDA GPU,
         warning_message is a human-readable string if there's a problem.
     """
-    # ⭐ Bez torcha w procesie nie ma czego sprawdzac — a `import torch` tutaj
-    # ciagnalby caly PyTorch przy starcie serwera i przy kazdym pollu zdrowia.
-    # Gdy zaladuje go pierwszy model, kolejne wywolanie zrobi pelny test.
+    # ⭐ Without torch in the process there is nothing to check — and `import torch`
+    # here would pull all of PyTorch in at server start and on every health poll.
+    # Once a model loads it, the next call runs the full test.
     torch = sys.modules.get("torch")
     if torch is None:
         return True, None
@@ -185,8 +185,8 @@ def empty_device_cache(device: str) -> None:
     if device not in ("cuda", "xpu"):
         return
 
-    # Silniki ggml/ONNX wolaja to samo na odladowaniu. Gdy torcha nie ma w
-    # procesie, nie ma tez jego cache — import bylby czysta strata 900 MB.
+    # ggml/ONNX engines call this on unload too. When torch is not in the process
+    # it has no cache either — importing it would be a pure waste of 900 MB.
     torch = sys.modules.get("torch")
     if torch is None:
         return
@@ -204,8 +204,8 @@ def manual_seed(seed: int, device: str) -> None:
     Covers CUDA and Intel XPU so that generation is reproducible
     regardless of which GPU backend is in use.
     """
-    # Nasiono dotyczy generatora TORCHA. Jesli torcha nie ma w procesie, to
-    # model, ktory zaraz mowi, nie jest torchowy i nie ma czego zasiewac.
+    # The seed is for TORCH's generator. If torch is not in the process, the model
+    # about to speak is not a torch model and there is nothing to seed.
     torch = sys.modules.get("torch")
     if torch is None:
         return

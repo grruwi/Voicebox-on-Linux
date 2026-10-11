@@ -1,0 +1,39 @@
+# OPTIONAL PyTorch engine (VoxCPM2) — ROCm, Radeons RX 9000 / RX 7000.
+# Not needed for audio.cpp's voices. Its perks: faster per sentence on Radeons, and the
+# ONLY road to training (fine-tuning, LoRA) — at the cost of a ~13 GB image and more
+# RAM/VRAM. Voicebox's Offloader keeps one model on the card across both engines.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.pytorch.yml up -d --build
+# or for good in .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.pytorch.yml
+# Weights (once): see the README, "PyTorch".
+
+services:
+  pytorch:
+    build: ./pytorch
+    image: pytorch-backend
+    container_name: pytorch-backend
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    shm_size: 16g
+    init: true
+    environment:
+      # ROCm 10 on RDNA4: without it one HSA thread spins a whole core forever while a
+      # model sits loaded (InterruptSignal::WaitRelaxed, ROCm/rocm-systems#12431).
+      # Only turns off the rocprofiler registration — rocprofv3 sees nothing.
+      HSA_TOOLS_DISABLE_REGISTER: "1"
+      # ⚠️ THE CACHES BELOW ARE NOT OPTIONAL. Without them every start compiles again:
+      # MIOpen searches its kernels, torch.compile/Triton rebuild the graphs (minutes).
+      MIOPEN_FIND_MODE: FAST
+      MIOPEN_USER_DB_PATH: /cache/miopen-db
+      MIOPEN_CUSTOM_CACHE_DIR: /cache/miopen-cache
+      TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+      TRITON_CACHE_DIR: /cache/triton
+    volumes:
+      # rw only for make_weights.py (prebuilt sets); the worker itself just reads
+      - ./models:/models
+      - ./data/pytorch/cache:/cache
+      # the denoiser (ModelScope) and the AMD code-object cache
+      - ./data/pytorch/modelscope:/root/.cache/modelscope
+      - ./data/pytorch/comgr:/root/.cache/comgr
+    restart: unless-stopped

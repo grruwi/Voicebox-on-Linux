@@ -13,7 +13,6 @@ import {
   Loader2,
   RotateCcw,
   Scale,
-  Trash2,
   Unplug,
   X,
 } from 'lucide-react';
@@ -61,16 +60,8 @@ const MODEL_DESCRIPTIONS: Record<string, string> = {
     'Lightweight ZipVoice-based TTS designed for high quality voice cloning and 48kHz speech generation at speeds exceeding 150x realtime.',
   voxcpm2:
     'Tokenizer-free multilingual TTS by OpenBMB. Native 48 kHz, zero-shot cloning from reference audio, and expression control via a plain-language "(style)" prefix on the text.',
-  'fish-s2-pro':
-    'Fish Audio S2 Pro via s2.cpp (ggml/Vulkan, no PyTorch). Dual-AR 4B model with the RVQ codec bundled inside the GGUF. Zero-shot cloning at 44.1 kHz and word-level expression control through free-form "[tag]" instructions.',
   'voxcpm2-pytorch':
-    'The same VoxCPM2 weights as above, but running on PyTorch/ROCm in a Docker container instead of ggml. Measurably slower (RTF 0.69 vs 0.54), and kept for one reason: LoRA fine-tuning only works on this path.',
-  'fish-s2-pro-pytorch':
-    'Fish Audio S2 Pro on PyTorch/ROCm in a Docker container, from weights quantised to int8 — only the 180 linear layers of the text model; the audio decoder and the DAC codec stay in bf16. Zero-shot cloning at 44.1 kHz. Context is cut to 4096 tokens (~3 min of speech), which is what keeps it at 11.5 GiB of VRAM instead of 16.2.',
-  'fish-s1-mini':
-    'Fish Audio S1-mini (0.5B dual-AR) running as a Docker container on PyTorch/ROCm. Zero-shot cloning at 44.1 kHz. Unlike every other engine here it is not a process but a container — loading starts it, offloading stops it.',
-  'supertonic-3':
-    'Supertone Supertonic 3 — 99M parameters on ONNX Runtime, running as a Docker container on the CPU alone, so it never competes for VRAM. 31 languages including Polish, 44.1 kHz, deterministic output. No cloning: ten fixed voice styles (M1-M5, F1-F5). Expression via <laugh>, <breath> and <sigh> tags in the text.',
+    'The same VoxCPM2 weights as above, running on PyTorch/ROCm in the `pytorch` engine container instead of ggml. The road to LoRA fine-tuning; also has its own OpenAI-compatible endpoint.',
   'chatterbox-tts':
     'Production-grade open source TTS by Resemble AI. Supports 23 languages with voice cloning and emotion exaggeration control.',
   'chatterbox-turbo':
@@ -90,11 +81,11 @@ const MODEL_DESCRIPTIONS: Record<string, string> = {
   'whisper-small':
     'Whisper Small (244M parameters). Good balance of speed and accuracy for transcription.',
   'whisper-medium':
-    'Whisper Medium w whisper.cpp (ggml). Kwantyzacja i karta/procesor — w Ustawieniach → Generation. Osobny proces, niezależny od głosu.',
+    'Whisper Medium on whisper.cpp (ggml). Quantization and GPU/CPU — in Settings → Generation. Its own container, independent of the voice.',
   'whisper-large':
-    'Whisper Large v3 w whisper.cpp (ggml). Najdokładniejszy. Kwantyzacja i karta/procesor — w Ustawieniach → Generation.',
+    'Whisper Large v3 on whisper.cpp (ggml). The most accurate. Quantization and GPU/CPU — in Settings → Generation.',
   'whisper-turbo':
-    'Whisper Large v3 Turbo w whisper.cpp (ggml) — dekoder odchudzony z 32 do 4 warstw, szybszy przy prawie tej samej jakości.',
+    'Whisper Large v3 Turbo on whisper.cpp (ggml) — the decoder slimmed from 32 to 4 layers, faster at almost the same quality.',
   'qwen3-0.6b':
     'Qwen3 0.6B — smallest of the Qwen3 instruct family. Very fast on CPU, runs at ~400 MB quantized on Apple Silicon. Good for dictation refinement and short completions.',
   'qwen3-1.7b':
@@ -377,17 +368,17 @@ export function ModelManagement() {
     },
   });
 
-  // Ładowanie z tego ekranu — tylko whisper (osobny proces, osobny klik od głosu).
+  // Loading from this screen — whisper or a voice engine (the Offloader makes room).
   const loadMutation = useMutation({
     mutationFn: async (modelName: string) => {
       return await apiClient.loadModel(modelName);
     },
     onSuccess: async (_data, modelName) => {
-      toast({ title: 'Załadowany', description: modelName });
+      toast({ title: 'Loaded', description: modelName });
       await queryClient.invalidateQueries({ queryKey: ['modelStatus'], refetchType: 'all' });
     },
     onError: (error: Error) => {
-      toast({ title: 'Nie udało się załadować', description: error.message, variant: 'destructive' });
+      toast({ title: 'Could not load', description: error.message, variant: 'destructive' });
     },
   });
 
@@ -439,12 +430,10 @@ export function ModelManagement() {
         m.model_name.startsWith('qwen-custom-voice') ||
         m.model_name.startsWith('voxcpm') ||
         m.model_name.startsWith('omnivoice') ||
-        m.model_name.startsWith('fish') ||
         m.model_name.startsWith('luxtts') ||
         m.model_name.startsWith('chatterbox') ||
         m.model_name.startsWith('tada') ||
-        m.model_name.startsWith('kokoro') ||
-        m.model_name.startsWith('supertonic'),
+        m.model_name.startsWith('kokoro'),
     ) ?? [];
   const whisperModels = modelStatus?.models.filter((m) => m.model_name.startsWith('whisper')) ?? [];
   const llmModels = modelStatus?.models.filter((m) => m.model_name.startsWith('qwen3-')) ?? [];
@@ -897,22 +886,21 @@ export function ModelManagement() {
                     </>
                   ) : freshSelectedModel.downloaded ? (
                     <div className="flex gap-2 flex-1">
-                      {!freshSelectedModel.loaded &&
-                        freshSelectedModel.model_name.startsWith('whisper') && (
-                          <Button
-                            size="sm"
-                            onClick={() => loadMutation.mutate(freshSelectedModel.model_name)}
-                            disabled={loadMutation.isPending}
-                            className="flex-1"
-                          >
-                            {loadMutation.isPending ? (
-                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                            ) : (
-                              <Download className="h-4 w-4 mr-2" />
-                            )}
-                            {loadMutation.isPending ? 'Ładuję…' : 'Załaduj'}
-                          </Button>
-                        )}
+                      {!freshSelectedModel.loaded && (
+                        <Button
+                          size="sm"
+                          onClick={() => loadMutation.mutate(freshSelectedModel.model_name)}
+                          disabled={loadMutation.isPending}
+                          className="flex-1"
+                        >
+                          {loadMutation.isPending ? (
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4 mr-2" />
+                          )}
+                          {loadMutation.isPending ? 'Loading…' : 'Load'}
+                        </Button>
+                      )}
                       {freshSelectedModel.loaded && (
                         <Button
                           size="sm"
@@ -931,41 +919,13 @@ export function ModelManagement() {
                             : t('models.actions.unload')}
                         </Button>
                       )}
-                      {/* Whisper ggml leży w voice-models (:ro) — backend go nie kasuje. */}
-                      {!freshSelectedModel.model_name.startsWith('whisper') && (
-                        <Button
-                          size="sm"
-                          onClick={() => {
-                            setModelToDelete({
-                              name: freshSelectedModel.model_name,
-                              displayName: freshSelectedModel.display_name,
-                              sizeMb: freshSelectedModel.size_mb,
-                            });
-                            setDeleteDialogOpen(true);
-                          }}
-                          variant="outline"
-                          disabled={freshSelectedModel.loaded}
-                          title={
-                            freshSelectedModel.loaded
-                              ? t('models.actions.unloadFirst')
-                              : t('models.actions.deleteModel')
-                          }
-                          className="flex-1"
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          {t('models.actions.deleteModel')}
-                        </Button>
-                      )}
+                      {/* No delete: the weights live next to the engine containers, not in Voicebox. */}
                     </div>
                   ) : (
-                    <Button
-                      size="sm"
-                      onClick={() => handleDownload(freshSelectedModel.model_name)}
-                      className="flex-1"
-                    >
-                      <Download className="h-4 w-4 mr-2" />
-                      {t('models.actions.download')}
-                    </Button>
+                    <p className="flex-1 text-xs text-muted-foreground">
+                      The weights are not on disk. Voicebox downloads nothing — run{' '}
+                      <code>download-models.sh</code>.
+                    </p>
                   )}
                 </div>
               </div>

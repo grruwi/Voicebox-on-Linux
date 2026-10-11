@@ -1,19 +1,16 @@
-"""VoxCPM2 na PyTorchu/ROCm w KONTENERZE — drugi vox, obok tego z ggml.
+"""VoxCPM2 on PyTorch/ROCm in the `pytorch` container — the second Vox, next to the ggml one.
 
-⚠️ TO JEST TEN SAM MODEL CO `voxcpm`, TYLKO INNY SILNIK. Rozdzielone celowo,
-zeby dalo sie je przelaczyc w GUI i uslyszec roznice:
+⚠️ THIS IS THE SAME MODEL AS `voxcpm`, ONLY ANOTHER ENGINE. Kept apart on purpose, so
+they can be switched in the GUI and the difference heard:
 
-    voxcpm     — ggml/Vulkan, `llama-tts-server` na :17496, RTF ~0,54-0,59
-    voxcpm_pt  — PyTorch/ROCm, kontener `voxcpm-pt` na :17498, RTF ~0,69-0,72
+    voxcpm     — audio.cpp (Vulkan/HIP), the `audiocpp` container
+    voxcpm_pt  — PyTorch/ROCm, the `voxcpm2` worker of the `pytorch` container
 
-PyTorch jest wolniejszy i to zmierzone (31.08, cfg 2.0 / timesteps 15, ta sama
-karta, `MIOPEN_FIND_MODE=FAST`). Zostaje mimo to, bo tedy — i tylko tedy —
-prowadzi droga do LoRA i fine-tuningu na polskim; ggml tego nie umie.
+PyTorch is also the road to LoRA and fine-tuning; ggml cannot do that.
 
-Serwer po drugiej stronie to NASZ plik (`/klocki/apczan-kutasu/voicebox/voice-models/voxcpm-pt/serwer.py`),
-nie upstream: repo VoxCPM2 na HuggingFace niesie same wagi, bez kodu serwera.
-⛔ Serwer nie ma zadnych domyslnych wartosci — pole nieprzyslane jest polem
-nieprzekazanym do `generate()`.
+The worker is OUR file (`pytorch/workers/voxcpm2/server.py`), not upstream: the VoxCPM2
+repo on HuggingFace ships weights only, no server code.
+⛔ The worker has no default values — a field that was not sent is not passed to `generate()`.
 """
 
 import asyncio
@@ -21,168 +18,167 @@ import base64
 import logging
 import os
 import re
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import ClassVar, List, Optional, Tuple
 
-from ..config import MODELE_GLOSOWE
-
 import numpy as np
 
+from ..config import VOICE_MODELS
+from ..services import pytorch_host
 from .base import combine_voice_prompts as _combine_voice_prompts
 
 logger = logging.getLogger(__name__)
 
 VOXCPM_SAMPLE_RATE = 48000
+MODEL = "voxcpm2"
+WEIGHTS_DIR = Path(os.environ.get("VOXCPM_PT_WEIGHTS") or VOICE_MODELS / "voxcpm-pt" / "weights")
 
-NAZWA_KONTENERA = "voxcpm-pt"
-ADRES_SERWERA = "http://127.0.0.1:17498"
-LAUNCHER = MODELE_GLOSOWE / "voxcpm-pt-up.sh"
-KATALOG_WAG = MODELE_GLOSOWE / "voxcpm-pt/wagi"
-
-# Nawias na poczatku tekstu = opis stylu. Ta sama regula co w silniku ggml.
-_PREFIKS_STYLU = re.compile(r"^\s*\([^)]{1,200}\)")
+# A parenthesis at the start of the text = a style description. Same rule as the ggml engine.
+_STYLE_PREFIX = re.compile(r"^\s*\([^)]{1,200}\)")
 
 
-def _cfg(nazwa: str, domyslnie: str) -> str:
-    return os.environ.get(nazwa, domyslnie).strip()
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
 
 
 class VoxCPMPyTorchBackend:
-    """VoxCPM2 w kontenerze. Wagi zyja w Dockerze, nie tutaj."""
+    """VoxCPM2 in the `pytorch` container. The weights live there, not here."""
+
+    # The Offloader unloads every OTHER engine host before this one loads.
+    ENGINE_HOST: ClassVar[str] = pytorch_host.HOST
 
     def __init__(self):
         self.model_size = "default"
-        self._sprawdzone = False
 
-    # -------------------------------------------------------------- pliki
+    # -------------------------------------------------------------- files
 
     @property
     def _model(self) -> Path:
-        return KATALOG_WAG / "model.safetensors"
+        return WEIGHTS_DIR / "model.safetensors"
 
     @property
     def _audiovae(self) -> Path:
-        return KATALOG_WAG / "audiovae.pth"
+        return WEIGHTS_DIR / "audiovae.pth"
 
     def _get_model_path(self, model_size: str = "default") -> str:
-        return str(KATALOG_WAG)
+        return str(WEIGHTS_DIR)
 
     def _is_model_cached(self, model_size: str = "default") -> bool:
         return self._model.exists() and self._audiovae.exists()
 
-    # -------------------------------------------------------------- kontener
+    # -------------------------------------------------------------- knobs
 
-    @property
-    def _serwer(self) -> str:
-        """Czytane przez `check_model_loaded` w `backends/__init__.py`."""
-        return ADRES_SERWERA
-
-    def _serwer_stoi(self) -> bool:
-        import socket
-        from urllib.parse import urlparse
-
-        cel = urlparse(ADRES_SERWERA)
-        if not cel.hostname or not cel.port:
-            return False
-        try:
-            with socket.create_connection((cel.hostname, cel.port), timeout=0.3):
-                return True
-        except OSError:
-            return False
+    # ⭐ THE KNOBS LIVE IN THE ENV FILE. ⛔ EMPTY = THE FIELD IS NOT SENT.
+    # Separate from `VOXCPM_*` (ggml) on purpose: another engine may need another
+    # operating point with the same weights.
+    _KNOBS: ClassVar[tuple] = (
+        ("cfg_value", "VOXCPM_PT_CFG"),
+        ("inference_timesteps", "VOXCPM_PT_TIMESTEPS"),
+        ("normalize", "VOXCPM_PT_NORMALIZE"),
+        ("denoise", "VOXCPM_PT_DENOISE"),
+        ("retry_badcase", "VOXCPM_PT_RETRY_BADCASE"),
+    )
 
     @staticmethod
-    def _docker(*argumenty: str, timeout: int = 60) -> subprocess.CompletedProcess:
-        """⚠️ Bez `sudo` — grruwi jest w grupie `docker`."""
-        return subprocess.run(
-            ["docker", *argumenty], capture_output=True, text=True, timeout=timeout
-        )
-
-    def _kontener_chodzi(self) -> bool:
-        wynik = self._docker("ps", "--filter", f"name={NAZWA_KONTENERA}",
-                             "--format", "{{.Names}}", timeout=10)
-        return NAZWA_KONTENERA in wynik.stdout.split()
-
-    def _zdrowy(self) -> bool:
-        """Sam otwarty port nie wystarczy — uvicorn slucha, zanim wczyta wagi."""
-        import requests
-
-        try:
-            odpowiedz = requests.get(ADRES_SERWERA + "/health", timeout=2)
-            return odpowiedz.status_code == 200 and '"ok"' in odpowiedz.text
-        except Exception:
-            return False
-
-    def _podnies(self) -> bool:
-        if not LAUNCHER.exists():
-            raise RuntimeError(f"nie ma launchera kontenera: {LAUNCHER}")
-
-        # ⚠️ Zatrzymany kontener podnosimy przez `docker start` — launcher w tym
-        # przypadku kasuje go i tworzy od nowa, co gubi log poprzedniego biegu.
-        wynik = self._docker("ps", "-a", "--filter", f"name={NAZWA_KONTENERA}",
-                             "--format", "{{.Names}}", timeout=10)
-        if NAZWA_KONTENERA not in wynik.stdout.split():
-            wynik = subprocess.run(
-                ["bash", str(LAUNCHER), "up"], capture_output=True, text=True, timeout=400
-            )
-            if wynik.returncode != 0:
-                ogon = (wynik.stderr or wynik.stdout or "").strip().splitlines()[-5:]
-                raise RuntimeError("voxcpm-pt-up.sh padl: " + " | ".join(ogon))
+    def _to_value(text: str):
+        if text.lower() in ("true", "yes", "1"):
             return True
-
-        self._docker("start", NAZWA_KONTENERA, timeout=30)
-
-        import time
-
-        for _ in range(180):
-            if self._zdrowy():
-                logger.info("voxcpm-pt: kontener gotowy na %s", ADRES_SERWERA)
-                return True
-            if not self._kontener_chodzi():
-                raise RuntimeError("voxcpm-pt: kontener zszedl przy starcie — `docker logs voxcpm-pt`")
-            time.sleep(1)
-        raise RuntimeError("voxcpm-pt: kontener nie odpowiedzial w 3 min")
-
-    def _ubij(self) -> bool:
-        if not self._kontener_chodzi():
+        if text.lower() in ("false", "no", "0"):
             return False
-        self._docker("stop", NAZWA_KONTENERA, timeout=60)
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return text
 
-        import time
+    @staticmethod
+    def _settings_row():
+        """⚠️ The MODULE, not the name: `SessionLocal` is only filled in by `init_db()`."""
+        from ..database import GenerationSettings
+        from ..database import session as db_session
 
-        for _ in range(30):
-            if not self._serwer_stoi():
-                logger.info("voxcpm-pt: kontener zszedl, VRAM oddany")
-                return True
-            time.sleep(0.5)
-        logger.warning("voxcpm-pt: kontener nie zszedl w 15 s")
-        return False
+        s = db_session.SessionLocal()
+        try:
+            return s.query(GenerationSettings).first()
+        finally:
+            s.close()
 
-    # -------------------------------------------------------------- zycie
+    def _from_database(self) -> dict:
+        """⭐ SLIDERS FROM THE GUI. The same columns as the ggml engine (`vox_cfg`,
+        `vox_timesteps`) — the same model, the same meaning, so one slider drives both."""
+        fields: dict = {}
+        try:
+            row = self._settings_row()
+            if row is not None:
+                if row.vox_cfg is not None:
+                    fields["cfg_value"] = float(row.vox_cfg)
+                if row.vox_timesteps is not None:
+                    fields["inference_timesteps"] = int(row.vox_timesteps)
+                # The seed from the request (API) wins — `_generate` overrides it after `_params()`.
+                if row.vox_seed is not None:
+                    fields["seed"] = int(row.vox_seed)
+        except Exception as error:
+            logger.debug("knobs not from the database (%s) — using the environment", error)
+        return fields
+
+    def _params(self) -> dict:
+        """Order: the env file → the DATABASE (GUI sliders). The slider wins, it has to
+        work from the next generation, without a backend restart — like the ggml engine."""
+        fields = {}
+        for name, variable in self._KNOBS:
+            value = _env(variable)
+            if not value:
+                continue
+            # cfg and timesteps are numbers — "1" has to stay a one, not True.
+            if name in ("cfg_value", "inference_timesteps"):
+                fields[name] = float(value) if name == "cfg_value" else int(value)
+            else:
+                fields[name] = self._to_value(value)
+        fields.update(self._from_database())
+        return fields
+
+    def _precision(self) -> dict:
+        """The precision set from the panel (`vox_base_lm` / `vox_acoustic`) = the worker's options."""
+        base_lm, acoustic = "q8", "f16"
+        try:
+            row = self._settings_row()
+            if row is not None:
+                base_lm = (row.vox_base_lm or base_lm).lower()
+                acoustic = (row.vox_acoustic or acoustic).lower()
+        except Exception as error:
+            logger.debug("precision not from the database (%s) — q8/f16", error)
+        # BaseLM f32 was cut from the panel (11.10, grruwi's call); the worker knows q8 | f16.
+        return {"base_lm": base_lm if base_lm in ("q8", "f16") else "q8", "acoustic": acoustic}
+
+    # -------------------------------------------------------------- life
 
     def is_loaded(self) -> bool:
-        # ⚠️ NIE sama flaga. Kontener zyje niezaleznie od tego procesu:
-        # podniesiony z shella albo przetrwaly restart backendu trzyma
-        # pamiec, a flaga jest wtedy False — offloader by go pominal
-        # i zaladowal drugi model obok. `docker ps`, nie health:
-        # pytanie brzmi "czy cos trzyma pamiec", nie "czy gotowy".
-        return self._sprawdzone or self._kontener_chodzi()
+        return pytorch_host.has(MODEL)
 
     async def load_model(self, model_size: str = "default") -> None:
-        brakuje = [str(p) for p in (self._model, self._audiovae) if not p.exists()]
-        if brakuje:
-            raise RuntimeError("brak wag VoxCPM2 (PyTorch): " + ", ".join(brakuje))
-        if not self._zdrowy():
-            await asyncio.to_thread(self._podnies)
-        if not self._sprawdzone:
-            self._sprawdzone = True
-            logger.info("VoxCPM2/PyTorch gotowy: %s", KATALOG_WAG)
+        missing = [str(p) for p in (self._model, self._audiovae) if not p.exists()]
+        if missing:
+            raise RuntimeError("no VoxCPM2 (PyTorch) weights: " + ", ".join(missing))
+        options = self._precision()
+        if not pytorch_host.has(MODEL, options):
+            # The panel changed the set or nothing is loaded → a new worker (blocking: load + compile).
+            await asyncio.to_thread(pytorch_host.load, MODEL, options)
+
+    def reload(self, base_lm: Optional[str] = None, acoustic: Optional[str] = None) -> dict:
+        """The "Reload" button on the Vox tab while THIS engine runs. Empty = the panel.
+        ⚠️ Blocking (load + compile) — call from a thread pool, not the event loop."""
+        options = self._precision()
+        options.update({k: v for k, v in (("base_lm", base_lm), ("acoustic", acoustic)) if v})
+        return pytorch_host.load(MODEL, options, force=True)
 
     def unload_model(self) -> None:
-        """Oddaje VRAM — czyli zatrzymuje kontener, bo tam leza wagi."""
-        self._sprawdzone = False
-        self._ubij()
+        """Gives VRAM back — the worker process goes, the container stays."""
+        if pytorch_host.has(MODEL):
+            pytorch_host.unload()
 
     async def create_voice_prompt(
         self,
@@ -199,80 +195,44 @@ class VoxCPMPyTorchBackend:
     ) -> Tuple[np.ndarray, str]:
         return await _combine_voice_prompts(audio_paths, reference_texts)
 
-    # -------------------------------------------------------------- pokretla
+    # -------------------------------------------------------------- speech
 
-    # ⭐ POKRETLA SIEDZA W LAUNCHERZE. ⛔ PUSTE = POLA NIE WYSYLAMY.
-    # Osobne od `VOXCPM_*` (ggml) celowo: to inny silnik i moze potrzebowac
-    # innego punktu pracy przy tych samych wagach.
-    _POKRETLA: ClassVar[tuple] = (
-        ("cfg_value", "VOXCPM_PT_CFG"),
-        ("inference_timesteps", "VOXCPM_PT_TIMESTEPS"),
-        ("normalize", "VOXCPM_PT_NORMALIZE"),
-        ("denoise", "VOXCPM_PT_DENOISE"),
-        ("retry_badcase", "VOXCPM_PT_RETRY_BADCASE"),
-    )
+    def _request(self, text: str, voice_prompt: dict, seed: Optional[int]) -> Tuple[dict, bool]:
+        ref_audio = voice_prompt.get("ref_audio")
+        ref_text = voice_prompt.get("ref_text")
+        if ref_audio and not Path(ref_audio).exists():
+            logger.warning("no reference sample: %s", ref_audio)
+            ref_audio = None
+
+        request = {"text": text}
+        request.update(self._params())
+        if seed is not None:
+            request["seed"] = seed
+
+        if ref_audio:
+            with open(ref_audio, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("ascii")
+
+            # Timbre — works without a transcript.
+            request["reference_wav"] = encoded
+
+            # ⚠️ The way of speaking — valid ONLY together with the transcript, upstream
+            # raises on `prompt_wav_path` alone. And it goes away when the text carries
+            # a style parenthesis: upstream forbids both instructions at once. The same
+            # rule as the ggml engine — see `voxcpm_gguf_backend.py`.
+            if ref_text and not _STYLE_PREFIX.match(text):
+                request["prompt_wav"] = encoded
+                request["prompt_text"] = ref_text
+        return request, bool(ref_audio)
 
     @staticmethod
-    def _na_wartosc(tekst: str):
-        if tekst.lower() in ("true", "yes", "tak", "1"):
-            return True
-        if tekst.lower() in ("false", "no", "nie", "0"):
-            return False
-        try:
-            return int(tekst)
-        except ValueError:
-            pass
-        try:
-            return float(tekst)
-        except ValueError:
-            return tekst
-
-    def _z_bazy(self) -> dict:
-        """⭐ SUWAKI Z GUI. Te same kolumny co silnik ggml (`vox_cfg`,
-        `vox_timesteps`) — ten sam model, ten sam sens parametru, wiec jeden
-        suwak steruje obydwoma. Bez tego kręcenie w GUI nie robilo tu NIC.
-
-        ⚠️ MODUL, nie nazwa: `SessionLocal` wypelnia sie dopiero w `init_db()`.
-        """
-        pola: dict = {}
-        try:
-            from ..database import session as db_session
-            from ..database import GenerationSettings
-
-            s = db_session.SessionLocal()
-            try:
-                w = s.query(GenerationSettings).first()
-                if w is not None:
-                    if w.vox_cfg is not None:
-                        pola["cfg_value"] = float(w.vox_cfg)
-                    if w.vox_timesteps is not None:
-                        pola["inference_timesteps"] = int(w.vox_timesteps)
-            finally:
-                s.close()
-        except Exception as blad:
-            logger.debug("pokretla nie z bazy (%s) — biore ze srodowiska", blad)
-        return pola
-
-    def _parametry(self) -> dict:
-        """Kolejnosc: `ustawienia.env` → BAZA (suwaki w GUI). Suwak wygrywa, bo
-        ma dzialac od nastepnej generacji, bez restartu backendu — tak samo jak
-        w silniku ggml.
-        """
-        pola = {}
-        for nazwa, zmienna in self._POKRETLA:
-            wartosc = _cfg(zmienna, "")
-            if not wartosc:
-                continue
-            # cfg i timesteps to liczby — „1" ma zostac jedynka, nie True.
-            if nazwa in ("cfg_value", "inference_timesteps"):
-                pola[nazwa] = float(wartosc) if nazwa == "cfg_value" else int(wartosc)
-            else:
-                pola[nazwa] = self._na_wartosc(wartosc)
-
-        pola.update(self._z_bazy())
-        return pola
-
-    # -------------------------------------------------------------- mowa
+    def _log(kind: str, request: dict, has_ref: bool, text: str) -> None:
+        logger.info(
+            "[VoxCPM2/pt] %s %s | ref=%s | mode=%s", kind,
+            {k: v for k, v in request.items() if k not in ("text", "reference_wav", "prompt_wav", "prompt_text")},
+            "yes" if has_ref else "no",
+            "style" if _STYLE_PREFIX.match(text) else "continuation",
+        )
 
     async def generate(
         self,
@@ -283,66 +243,28 @@ class VoxCPMPyTorchBackend:
         instruct: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
         await self.load_model()
+        request, has_ref = self._request(text, voice_prompt, seed)
+        self._log("WHOLE", request, has_ref, text)
+        return await asyncio.to_thread(self._generate, request)
 
-        ref_audio = voice_prompt.get("ref_audio")
-        ref_text = voice_prompt.get("ref_text")
-        if ref_audio and not Path(ref_audio).exists():
-            logger.warning("nie ma probki referencyjnej: %s", ref_audio)
-            ref_audio = None
-
-        return await asyncio.to_thread(self._generuj, text, ref_audio, ref_text, seed)
-
-    def _generuj(
-        self,
-        text: str,
-        ref_audio: Optional[str],
-        ref_text: Optional[str],
-        seed: Optional[int],
-    ) -> Tuple[np.ndarray, int]:
+    def _generate(self, request: dict) -> Tuple[np.ndarray, int]:
         import requests
 
-        zadanie = {"text": text}
-        zadanie.update(self._parametry())
-        if seed is not None:
-            zadanie["seed"] = seed
+        response = requests.post(pytorch_host.worker_url() + "/generate", json=request, timeout=900)
+        response.raise_for_status()
 
-        if ref_audio:
-            with open(ref_audio, "rb") as plik:
-                zakodowane = base64.b64encode(plik.read()).decode("ascii")
-
-            # Barwa — dziala bez transkryptu.
-            zadanie["reference_wav"] = zakodowane
-
-            # ⚠️ Sposob mowienia — wazny TYLKO w parze z transkryptem, upstream
-            # rzuca przy samym `prompt_wav_path`. I odpada, gdy tekst niesie
-            # nawias stylu: upstream zabrania obu instrukcji naraz. Ta sama
-            # regula co w silniku ggml — patrz `voxcpm_backend.py`.
-            if ref_text and not _PREFIKS_STYLU.match(text):
-                zadanie["prompt_wav"] = zakodowane
-                zadanie["prompt_text"] = ref_text
-
-        logger.info(
-            "[VoxCPM2/pt] %s | ref=%s | tryb=%s",
-            {k: v for k, v in zadanie.items() if k not in ("text", "reference_wav", "prompt_wav")},
-            "tak" if ref_audio else "nie",
-            "styl" if _PREFIKS_STYLU.match(text) else "kontynuacja",
-        )
-
-        odpowiedz = requests.post(ADRES_SERWERA + "/generuj", json=zadanie, timeout=900)
-        odpowiedz.raise_for_status()
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as plik:
-            plik.write(odpowiedz.content)
-            sciezka = Path(plik.name)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(response.content)
+            path = Path(f.name)
         try:
-            return self._czytaj_wav(sciezka)
+            return self._read_wav(path)
         finally:
-            sciezka.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
-    # -------------------------------------------------------------- strumien
+    # -------------------------------------------------------------- stream
 
-    # ⭐ Konsument rozpoznaje ten silnik przez `hasattr(backend, "generate_stream")`.
-    # Silnik bez tej metody leci stara droga — zaden inny backend nie wymaga zmian.
+    # ⭐ The consumer recognizes this engine by `hasattr(backend, "generate_stream")`.
+    # An engine without this method takes the old road — no other backend needs changes.
     SAMPLE_RATE: ClassVar[int] = VOXCPM_SAMPLE_RATE
 
     async def generate_stream(
@@ -353,90 +275,69 @@ class VoxCPMPyTorchBackend:
         seed: Optional[int] = None,
         instruct: Optional[str] = None,
     ):
-        """Kawalki dzwieku w miare powstawania, jako `np.float32` @ 48 kHz.
+        """Audio chunks as they are made, as `np.float32` @ 48 kHz.
 
-        ⚠️ CALKOWITY CZAS TAKI SAM jak `generate()` — zysk to PIERWSZY DZWIEK
-        po ~0,25 s zamiast po calosci. Sens ma tam, gdzie ktos slucha na zywo.
-        ⛔ Efekty i normalizacja poziomow NIE dzialaja na strumieniu — obie
-        potrzebuja calego przebiegu. Konsument musi to wiedziec.
+        ⚠️ THE TOTAL TIME IS THE SAME as `generate()` — the gain is the FIRST SOUND
+        after ~0.25 s instead of after the whole thing. It matters where someone listens live.
+        ⛔ Effects and level normalization do NOT work on the stream — both need the
+        whole take. The consumer has to know it.
         """
         await self.load_model()
+        request, has_ref = self._request(text, voice_prompt, seed)
+        self._log("STREAM", request, has_ref, text)
 
-        ref_audio = voice_prompt.get("ref_audio")
-        ref_text = voice_prompt.get("ref_text")
-        if ref_audio and not Path(ref_audio).exists():
-            logger.warning("nie ma probki referencyjnej: %s", ref_audio)
-            ref_audio = None
+        # ⛔ NO LIMIT (30.09). The thread puts via `call_soon_threadsafe(put_nowait)`, so a
+        # full queue does NOT slow the thread down, it raises QueueFull in the loop — a chunk
+        # or the END gets lost and the generation hangs forever, with the whole job queue
+        # behind it. The engine computes ~3x faster than ffplay plays; a long utterance went
+        # past 64 chunks. The whole utterance in RAM is a few MB.
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        END = object()
 
-        zadanie = {"text": text}
-        zadanie.update(self._parametry())
-        if seed is not None:
-            zadanie["seed"] = seed
-
-        if ref_audio:
-            with open(ref_audio, "rb") as plik:
-                zakodowane = base64.b64encode(plik.read()).decode("ascii")
-            zadanie["reference_wav"] = zakodowane
-            if ref_text and not _PREFIKS_STYLU.match(text):
-                zadanie["prompt_wav"] = zakodowane
-                zadanie["prompt_text"] = ref_text
-
-        logger.info(
-            "[VoxCPM2/pt] STRUMIEN %s | ref=%s",
-            {k: v for k, v in zadanie.items()
-             if k not in ("text", "reference_wav", "prompt_wav", "prompt_text")},
-            "tak" if ref_audio else "nie",
-        )
-
-        # ⛔ BEZ LIMITU (30.09). Watek wklada przez `call_soon_threadsafe(put_nowait)`,
-
-        # wiec pelna kolejka NIE hamuje watku, tylko rzuca QueueFull w petli — ginie
-
-        # kawalek albo KONIEC i generacja wisi na zawsze, a za nia cala kolejka zadan.
-
-        # Silnik liczy ~3x szybciej niz ffplay gra; od strumienia co krok (upstream)
-
-        # dluga wypowiedz przebijala 64 kawalki. Cala wypowiedz w RAM to kilka MB.
-
-        kolejka: asyncio.Queue = asyncio.Queue()
-        petla = asyncio.get_running_loop()
-        KONIEC = object()
-
-        def pobieraj():
-            """Blokujace czytanie strumienia HTTP w osobnym watku."""
+        def fetch():
+            """Blocking read of the HTTP stream in a separate thread."""
             import requests
 
+            rest = b""
             try:
-                with requests.post(ADRES_SERWERA + "/generuj/strumien",
-                                   json=zadanie, stream=True, timeout=900) as odpowiedz:
-                    odpowiedz.raise_for_status()
-                    for blok in odpowiedz.iter_content(chunk_size=None):
-                        if blok:
-                            petla.call_soon_threadsafe(
-                                kolejka.put_nowait, np.frombuffer(blok, dtype=np.float32)
+                with requests.post(pytorch_host.worker_url() + "/generate/stream",
+                                   json=request, stream=True, timeout=900) as response:
+                    response.raise_for_status()
+                    for block in response.iter_content(chunk_size=None):
+                        # A float32 must not be split between HTTP blocks;
+                        # an incomplete tail waits to be joined to the next one.
+                        block = rest + block
+                        cut = len(block) % 4
+                        rest = block[len(block) - cut:] if cut else b""
+                        if cut:
+                            block = block[:len(block) - cut]
+                        if block:
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait, np.frombuffer(block, dtype="<f4").copy()
                             )
-            except Exception as blad:
-                petla.call_soon_threadsafe(kolejka.put_nowait, blad)
+            except Exception as error:
+                loop.call_soon_threadsafe(queue.put_nowait, error)
             finally:
-                petla.call_soon_threadsafe(kolejka.put_nowait, KONIEC)
+                loop.call_soon_threadsafe(queue.put_nowait, END)
 
-        zadanie_watku = asyncio.create_task(asyncio.to_thread(pobieraj))
+        thread_task = asyncio.create_task(asyncio.to_thread(fetch))
         try:
             while True:
-                pozycja = await kolejka.get()
-                if pozycja is KONIEC:
+                item = await queue.get()
+                if item is END:
                     break
-                if isinstance(pozycja, Exception):
-                    raise pozycja
-                yield pozycja
+                if isinstance(item, Exception):
+                    raise item
+                yield item
         finally:
-            await zadanie_watku
+            await thread_task
 
     @staticmethod
-    def _czytaj_wav(sciezka: Path) -> Tuple[np.ndarray, int]:
+    def _read_wav(path: Path) -> Tuple[np.ndarray, int]:
         import soundfile as sf
 
-        dzwiek, czestotliwosc = sf.read(str(sciezka), dtype="float32", always_2d=False)
-        if dzwiek.ndim > 1:
-            dzwiek = dzwiek.mean(axis=1)
-        return dzwiek.astype(np.float32), czestotliwosc
+        audio, rate = sf.read(str(path), dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return audio.astype(np.float32), rate

@@ -57,15 +57,12 @@ async def watchdog_disable():
 @router.get("/health", response_model=models.HealthResponse)
 async def health():
     """Health check endpoint."""
-    from huggingface_hub import constants as hf_constants
-    from pathlib import Path
-
     tts_model = tts.get_tts_model()
     backend_type = get_backend_type()
 
-    # ⭐ Torch tylko wtedy, gdy JUZ siedzi w procesie. Zdrowie jest odpytywane
-    # co kilka sekund, wiec `import torch` tutaj wciagalby caly PyTorch przy
-    # pierwszym pollu — a Voicebox ma go brac dopiero pod model.
+    # ⭐ Torch only when it is ALREADY in the process. Health is polled every few
+    # seconds, so `import torch` here would pull in all of PyTorch on the first
+    # poll — and Voicebox should only take it for a model.
     torch = sys.modules.get("torch")
 
     has_cuda = bool(torch is not None and torch.cuda.is_available())
@@ -111,7 +108,7 @@ async def health():
 
         _compatible, gpu_compat_warning = check_cuda_compatibility()
 
-    etykieta_sysfs = gpu_probe.etykieta_bez_torcha()
+    sysfs_label = gpu_probe.label_without_torch()
 
     gpu_available = (
         has_cuda
@@ -119,7 +116,7 @@ async def health():
         or has_xpu
         or has_directml
         or backend_type == "mlx"
-        or etykieta_sysfs is not None
+        or sysfs_label is not None
     )
 
     gpu_type = None
@@ -137,11 +134,11 @@ async def health():
     elif has_directml:
         gpu_type = f"DirectML ({directml_name})"
     else:
-        gpu_type = etykieta_sysfs
+        gpu_type = sysfs_label
 
-    # Kernel podaje zajetosc CALEJ karty — pulpit, przegladarka, ggml, torch.
-    # `torch.cuda.memory_allocated()` widzi wylacznie wlasny alokator, wiec
-    # przy silnikach ggml pokazywalby zero obok zajetych gigabajtow.
+    # The kernel reports the use of the WHOLE card — desktop, browser, ggml, torch.
+    # `torch.cuda.memory_allocated()` sees only its own allocator, so with ggml
+    # engines it would show zero next to gigabytes in use.
     vram_sysfs = gpu_probe.vram_sysfs_mb()
     vram_used = vram_sysfs[0] if vram_sysfs else None
     if vram_used is None and has_cuda:
@@ -164,33 +161,10 @@ async def health():
         model_loaded = False
         model_size = None
 
+    # The default engine's weights on disk (Voicebox downloads nothing itself).
     model_downloaded = None
     try:
-        from ..backends import get_model_config
-
-        default_config = get_model_config("qwen-tts-1.7B")
-        default_model_id = default_config.hf_repo_id if default_config else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-
-        try:
-            from huggingface_hub import scan_cache_dir
-
-            cache_info = scan_cache_dir()
-            for repo in cache_info.repos:
-                if repo.repo_id == default_model_id:
-                    model_downloaded = True
-                    break
-        except (ImportError, Exception):
-            cache_dir = hf_constants.HF_HUB_CACHE
-            repo_cache = Path(cache_dir) / ("models--" + default_model_id.replace("/", "--"))
-            if repo_cache.exists():
-                has_model_files = (
-                    any(repo_cache.rglob("*.bin"))
-                    or any(repo_cache.rglob("*.safetensors"))
-                    or any(repo_cache.rglob("*.pt"))
-                    or any(repo_cache.rglob("*.pth"))
-                    or any(repo_cache.rglob("*.npz"))
-                )
-                model_downloaded = has_model_files
+        model_downloaded = bool(tts_model._is_model_cached())
     except Exception:
         pass
 

@@ -1,19 +1,20 @@
-"""Zgodnosc z OpenAI: /v1/audio/{speech,voices,models,transcriptions}.
+"""OpenAI compatibility: /v1/audio/{speech,voices,models,transcriptions}.
 
-Po co: Open WebUI i Newelle znaja tylko standard OpenAI — bez tego mikrofon
-i glosnik w ich czacie nie maja do czego gadac. Adres bazowy w ich panelu:
-`http://kombajn:17494/v1`, klucz API dowolny (nie sprawdzamy).
+Why: Open WebUI, Newelle and the like only know the OpenAI standard — without this
+the microphone and the speaker in their chat have nothing to talk to. Base URL in
+their settings: `http://<voicebox-host>:17493/v1`, any API key (not checked).
 
-Mowa idzie ta sama kolejka co GUI i MCP (`generate_speech` → `run_generation`),
-wiec jedno zadanie naraz, pokretla z panelu i wpis w historii (zrodlo
-"openai"). ⛔ Dzwiek NIE leci na glosniki kombajnu — gra go klient, ktory
-pytal (przegladarka moze byc na telefonie). Wylaczenia: `_zrodlo_openai`
-w services/generation.py i AGENT_SOURCES we froncie.
+Speech goes through the same queue as the GUI and MCP (`generate_speech` →
+`run_generation`), so one job at a time, the panel's knobs and a history entry
+(source "openai"). ⛔ The sound does NOT play on the server's speakers — the client
+that asked plays it (the browser may be on a phone). Exceptions:
+`_source_is_openai` in services/generation.py and AGENT_SOURCES in the frontend.
 
-`voice` = nazwa profilu (bez rozrozniania wielkosci liter). Puste = profil
-domyslny z panelu MCP. `model` ignorowany — silnik bierze sie z profilu.
-`instructions` = nawias Voxa (`(…)` przed tekstem) — TYLKO dla profili na voxie.
-OmniVoice i reszta dostaja je polem `instruct` (Omni: opis glosu), nigdy w tekscie.
+`voice` = a profile name (case-insensitive). Empty = the default profile from the
+MCP panel. `model` is ignored — the engine comes from the profile.
+`instructions` = Vox's parentheses (`(…)` in front of the text) — ONLY for Vox
+profiles. OmniVoice and the rest get them in the `instruct` field (Omni: a voice
+description), never in the text.
 """
 
 from __future__ import annotations
@@ -35,9 +36,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/audio")
 
-# response_format → (Content-Type, argumenty ffmpeg na wyjsciu). `None` = oddaj WAV
-# z dysku bez przekodowania. `pcm` jak u OpenAI: surowe s16le mono 24 kHz.
-FORMATY = {
+# response_format → (Content-Type, ffmpeg output arguments). `None` = send the WAV
+# from disk without re-encoding. `pcm` as in OpenAI: raw s16le mono 24 kHz.
+FORMATS = {
     "mp3": ("audio/mpeg", ["-c:a", "libmp3lame", "-q:a", "2", "-f", "mp3"]),
     "opus": ("audio/ogg", ["-c:a", "libopus", "-b:a", "64k", "-f", "ogg"]),
     "aac": ("audio/aac", ["-c:a", "aac", "-b:a", "128k", "-f", "adts"]),
@@ -46,8 +47,9 @@ FORMATY = {
     "wav": ("audio/wav", None),
 }
 
-# Limit nawiasu Voxa — dluzszy backend nie wykryje i po cichu wraca kontynuacja.
-NAWIAS_MAX = 200
+# Vox's parentheses limit — a longer one the backend does not detect, and it silently
+# falls back to continuation.
+PARENTHESES_MAX = 200
 # `GenerationRequest.instruct` (models.py, max_length)
 INSTRUCT_MAX = 500
 
@@ -58,152 +60,153 @@ class SpeechRequest(BaseModel):
     model: str | None = None
     response_format: str = "mp3"
     instructions: str | None = None
-    speed: float | None = None  # Vox nie ma tempa jako liczby — ignorowane
+    speed: float | None = None  # Vox has no speed as a number — ignored
 
 
-def _ustawienia_panelu(db: Session) -> dict:
-    """Normalizacja, ciecie i przenikanie z panelu — tak samo jak MCP.
+def _panel_settings(db: Session) -> dict:
+    """Normalization, chunking and crossfade from the panel — same as MCP.
 
-    Pydantic ma tam wlasne defaulty (True / 800 / 50 ms), ktore bez tego
-    przebilyby suwaki w GUI.
+    Pydantic has its own defaults there (True / 800 / 50 ms), which would otherwise
+    override the sliders in the GUI.
     """
     from ..database.models import GenerationSettings
 
-    pola: dict = {}
+    fields: dict = {}
     try:
-        ustawienia = db.query(GenerationSettings).first()
-        if ustawienia is not None:
-            pola["normalize"] = bool(ustawienia.normalize_audio)
-            if ustawienia.max_chunk_chars is not None:
-                pola["max_chunk_chars"] = ustawienia.max_chunk_chars
-            if ustawienia.crossfade_ms is not None:
-                pola["crossfade_ms"] = ustawienia.crossfade_ms
+        settings = db.query(GenerationSettings).first()
+        if settings is not None:
+            fields["normalize"] = bool(settings.normalize_audio)
+            if settings.max_chunk_chars is not None:
+                fields["max_chunk_chars"] = settings.max_chunk_chars
+            if settings.crossfade_ms is not None:
+                fields["crossfade_ms"] = settings.crossfade_ms
     except Exception:
         pass
-    return pola
+    return fields
 
 
-async def _czekaj_na_koniec(generation_id: str, kolejka, db: Session) -> DBGeneration:
-    """Czekaj na `speak-end` z szyny zdarzen; baza co sekunde jako siatka.
+async def _wait_for_end(generation_id: str, queue, db: Session) -> DBGeneration:
+    """Wait for `speak-end` from the event bus; the database every second as a net.
 
-    Szyna gubi zdarzenia przy pelnej kolejce (maxsize 64), wiec samo
-    czekanie na nia mogloby wisiec w nieskonczonosc.
+    The bus drops events when its queue is full (maxsize 64), so waiting on it
+    alone could hang forever.
     """
     while True:
         try:
-            zdarzenie = await asyncio.wait_for(kolejka.get(), timeout=1.0)
-            if zdarzenie.get("generation_id") != generation_id:
+            event = await asyncio.wait_for(queue.get(), timeout=1.0)
+            if event.get("generation_id") != generation_id:
                 continue
         except asyncio.TimeoutError:
             pass
         db.expire_all()
-        wiersz = db.query(DBGeneration).filter_by(id=generation_id).first()
-        if wiersz is None:
-            raise HTTPException(status_code=500, detail="Generacja zniknela z bazy.")
-        if wiersz.status in ("completed", "failed"):
-            return wiersz
+        row = db.query(DBGeneration).filter_by(id=generation_id).first()
+        if row is None:
+            raise HTTPException(status_code=500, detail="The generation vanished from the database.")
+        if row.status in ("completed", "failed"):
+            return row
 
 
-async def _przekoduj(sciezka: str, argumenty: list[str]) -> bytes:
-    proces = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", sciezka, *argumenty, "pipe:1",
+async def _transcode(path: str, arguments: list[str]) -> bytes:
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, *arguments, "pipe:1",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    wyjscie, bledy = await proces.communicate()
-    if proces.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"ffmpeg: {bledy.decode(errors='replace').strip()}")
-    return wyjscie
+    output, errors = await process.communicate()
+    if process.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg: {errors.decode(errors='replace').strip()}")
+    return output
 
 
 @router.post("/speech")
 async def speech(data: SpeechRequest, db: Session = Depends(get_db)):
     format_ = (data.response_format or "mp3").lower()
-    if format_ not in FORMATY:
+    if format_ not in FORMATS:
         raise HTTPException(
             status_code=400,
-            detail=f"Format '{format_}' nieobslugiwany. Dostepne: {', '.join(FORMATY)}",
+            detail=f"Format '{format_}' not supported. Available: {', '.join(FORMATS)}",
         )
-    tekst = data.input.strip()
-    if not tekst:
-        raise HTTPException(status_code=400, detail="Pusty `input`.")
+    text = data.input.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty `input`.")
 
-    profil = resolve_profile(data.voice or None, None, db)
-    if profil is None:
+    profile = resolve_profile(data.voice or None, None, db)
+    if profile is None:
         if data.voice:
             raise HTTPException(
                 status_code=404,
-                detail=f"Profil '{data.voice}' nie istnieje. Lista: GET /v1/audio/voices",
+                detail=f"Profile '{data.voice}' does not exist. List: GET /v1/audio/voices",
             )
         raise HTTPException(
             status_code=400,
-            detail="Brak `voice` i brak profilu domyslnego (Voicebox → Settings → MCP).",
+            detail="No `voice` and no default profile (Voicebox → Settings → MCP).",
         )
 
-    instrukcja = (data.instructions or "").strip()
-    # Silnik jak w `_resolve_generation_engine` (engine=None nizej): nawias rozumie tylko vox —
-    # OmniVoice przeczytalby go na glos, wiec dostaje instrukcje osobnym polem.
-    silnik = getattr(profil, "default_engine", None) or getattr(profil, "preset_engine", None) or ""
+    instruction = (data.instructions or "").strip()
+    # The engine as in `_resolve_generation_engine` (engine=None below): only Vox
+    # understands the parentheses — OmniVoice would read them aloud, so it gets the
+    # instruction in a separate field.
+    engine = getattr(profile, "default_engine", None) or getattr(profile, "preset_engine", None) or ""
     instruct = None
-    if instrukcja and silnik.startswith("voxcpm"):
-        if len(instrukcja) > NAWIAS_MAX:
+    if instruction and engine.startswith("voxcpm"):
+        if len(instruction) > PARENTHESES_MAX:
             raise HTTPException(
                 status_code=400,
-                detail=f"`instructions` ma {len(instrukcja)} znakow, Vox czyta nawias do {NAWIAS_MAX}.",
+                detail=f"`instructions` has {len(instruction)} characters, Vox reads parentheses up to {PARENTHESES_MAX}.",
             )
-        tekst = f"({instrukcja}){tekst}"
-    elif instrukcja:
-        if len(instrukcja) > INSTRUCT_MAX:
+        text = f"({instruction}){text}"
+    elif instruction:
+        if len(instruction) > INSTRUCT_MAX:
             raise HTTPException(
                 status_code=400,
-                detail=f"`instructions` ma {len(instrukcja)} znakow, limit {INSTRUCT_MAX}.",
+                detail=f"`instructions` has {len(instruction)} characters, the limit is {INSTRUCT_MAX}.",
             )
-        instruct = instrukcja
+        instruct = instruction
 
     from .generations import generate_speech
 
-    # Subskrypcja PRZED kolejka — inaczej krotka generacja moglaby skonczyc
-    # sie, zanim zaczniemy sluchac.
-    kolejka = mcp_events.subscribe()
+    # Subscribe BEFORE queueing — otherwise a short generation could finish before
+    # we start listening.
+    queue = mcp_events.subscribe()
     try:
-        generacja = await generate_speech(
+        generation = await generate_speech(
             models.GenerationRequest(
-                profile_id=profil.id,
-                text=tekst,
-                language=profil.language or "en",
+                profile_id=profile.id,
+                text=text,
+                language=profile.language or "en",
                 engine=None,
                 instruct=instruct,
-                **_ustawienia_panelu(db),
+                **_panel_settings(db),
             ),
             db,
             source="openai",
         )
-        wiersz = await _czekaj_na_koniec(generacja.id, kolejka, db)
+        row = await _wait_for_end(generation.id, queue, db)
     finally:
-        mcp_events.unsubscribe(kolejka)
+        mcp_events.unsubscribe(queue)
 
-    if wiersz.status == "failed":
-        raise HTTPException(status_code=500, detail=wiersz.error or "Generacja padla.")
-    sciezka = config.resolve_storage_path(wiersz.audio_path)
-    if not sciezka or not sciezka.exists():
-        raise HTTPException(status_code=500, detail="Brak pliku po generacji.")
+    if row.status == "failed":
+        raise HTTPException(status_code=500, detail=row.error or "The generation failed.")
+    path = config.resolve_storage_path(row.audio_path)
+    if not path or not path.exists():
+        raise HTTPException(status_code=500, detail="No audio file after the generation.")
 
-    typ, argumenty = FORMATY[format_]
-    if argumenty is None:
-        return FileResponse(sciezka, media_type=typ)
-    return Response(content=await _przekoduj(str(sciezka), argumenty), media_type=typ)
+    media_type, arguments = FORMATS[format_]
+    if arguments is None:
+        return FileResponse(path, media_type=media_type)
+    return Response(content=await _transcode(str(path), arguments), media_type=media_type)
 
 
 @router.get("/voices")
 async def voices(db: Session = Depends(get_db)):
-    """Profile Voiceboxa jako glosy. id = nazwa, bo w Newelle wpisuje sie ja recznie."""
-    profile = (
+    """Voicebox profiles as voices. id = the name, because Newelle has it typed in by hand."""
+    profiles = (
         db.query(DBVoiceProfile)
         .filter(DBVoiceProfile.voice_type != "import")
         .order_by(DBVoiceProfile.name)
         .all()
     )
-    return {"voices": [{"id": p.name, "name": p.name} for p in profile]}
+    return {"voices": [{"id": p.name, "name": p.name} for p in profiles]}
 
 
 @router.get("/models")
@@ -219,21 +222,21 @@ async def transcriptions(
     prompt: str | None = Form(None),
     response_format: str = Form("json"),
 ):
-    """Whisper z panelu. `model` przechodzi tylko, gdy to nasz rozmiar
-    (medium/large/turbo) — „whisper-1" od klientow OpenAI = wybor z panelu."""
-    from ..backends import WHISPER_HF_REPOS
+    """Whisper from the panel. `model` passes only when it is one of our sizes
+    (medium/large/turbo) — "whisper-1" from OpenAI clients = the panel's choice."""
+    from ..services import whisper_host
     from .transcription import transcribe_audio
 
-    wynik = await transcribe_audio(
+    result = await transcribe_audio(
         file=file,
         language=language or None,
-        model=model if model in WHISPER_HF_REPOS else None,
+        model=model if model in whisper_host.MODELS else None,
         prompt=prompt,
         carry_initial_prompt=None,
         max_len=None,
     )
     if response_format == "text":
-        return PlainTextResponse(wynik.text)
+        return PlainTextResponse(result.text)
     if response_format == "verbose_json":
-        return {"text": wynik.text, "duration": wynik.duration, "language": language}
-    return {"text": wynik.text}
+        return {"text": result.text, "duration": result.duration, "language": language}
+    return {"text": result.text}

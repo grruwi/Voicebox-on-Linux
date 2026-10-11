@@ -25,7 +25,7 @@ from ..utils.images import process_avatar, validate_image
 
 logger = logging.getLogger(__name__)
 
-CLONING_ENGINES = {"qwen", "luxtts", "chatterbox", "chatterbox_turbo", "tada", "voxcpm", "voxcpm_pt", "fish_s2", "fish_s1", "fish_s2_pt", "omnivoice"}
+CLONING_ENGINES = {"voxcpm", "voxcpm_pt", "omnivoice"}
 
 
 def _profile_to_response(
@@ -557,8 +557,8 @@ async def create_voice_prompt_for_profile(
         return {
             "voice_type": "preset",
             "preset_engine": profile.preset_engine,
-            # ⭐ Nadpisanie z zadania — dzieki temu JEDEN kafelek profilu obsluguje
-            # wszystkie glosy silnika, zamiast profilu na kazdy glos.
+            # ⭐ An override from the request — this way ONE profile tile serves every
+            # voice of the engine, instead of a profile per voice.
             "preset_voice_id": preset_voice_override or profile.preset_voice_id,
         }
 

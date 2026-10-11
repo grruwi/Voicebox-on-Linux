@@ -18,11 +18,10 @@ if _custom_models_dir:
     os.environ["HF_HUB_CACHE"] = _custom_models_dir
     logger.info("Model download path set to: %s", _custom_models_dir)
 
-# Wagi silnikow zewnetrznych (fish s1/s2, voxcpm-pt, s2.cpp) — JEDNA sciezka
-# dla hosta i kontenera. Compose montuje ten katalog 1:1, wiec `Path.home()`
-# nie wchodzi w gre: HOME kontenera to /app/data, HOME hosta to /home/grruwi.
-# `VOICEBOX_MODELE` — inna maszyna (publiczne repo: /modele); puste = kombajn.
-MODELE_GLOSOWE = Path(os.environ.get("VOICEBOX_MODELE") or "/klocki/apczan-kutasu/voicebox/voice-models")
+# Weights of the engines outside Voicebox (audio.cpp, PyTorch, whisper.cpp) — ONE path
+# for the host and every container. Compose mounts this directory 1:1, so `Path.home()`
+# is out of the question: the container's HOME is /app/data, the host's is someone's home.
+VOICE_MODELS = Path(os.environ.get("VOICEBOX_VOICE_MODELS") or "/models")
 
 # Default data directory (used in development)
 _data_dir = Path("data").resolve()

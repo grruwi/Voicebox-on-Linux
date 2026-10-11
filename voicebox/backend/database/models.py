@@ -231,60 +231,56 @@ class GenerationSettings(Base):
     crossfade_ms = Column(Integer, nullable=False, default=50)
     normalize_audio = Column(Boolean, nullable=False, default=True)
     autoplay_on_generate = Column(Boolean, nullable=False, default=True)
-    # Pokretla VoxCPM2 wystawione do GUI (16.08). Wczesniej siedzialy w
-    # `_DEFAULTS` w kodzie i w `ustawienia.env` — czyli kazda zmiana wymagala
-    # restartu backendu. Tu ida z baza, wiec dzialaja od nastepnej generacji.
-    # cfg      — jak sztywno model trzyma sie nawiasu sterujacego
-    # timesteps— kroki dyfuzji: 30 do PROBEK, 10 do gadania, 8 to prog
+    # VoxCPM2 knobs exposed in the GUI (16.08). They used to sit in `_DEFAULTS` in the
+    # code and in the env file — so every change needed a backend restart. Here they
+    # go with the database, so they work from the next generation.
+    # cfg       — how strictly the model follows the steering parenthesis
+    # timesteps — diffusion steps: 30 for SAMPLES, 10 for talking, 8 is the threshold
     vox_cfg = Column(Float, nullable=False, default=2.0)
     vox_timesteps = Column(Integer, nullable=False, default=10)
-    # temperature — szum w dyfuzji. Silnik ma 1.0 i az do teraz nikt jej
-    # nie podawal, wiec kazda generacja szla na wartosci domyslnej.
+    # temperature — the noise in the diffusion. The engine uses 1.0, and until now
+    # nobody passed it, so every generation ran on the default.
     vox_temperature = Column(Float, nullable=False, default=1.0)
-    # ⛔ NULL = ZIARNO LOSOWE, i tak ma byc domyslnie. CLI ma `--seed` z twardo
-    # wpisana 42, wiec staly seed daje ten sam plik co do bajta — a wtedy
-    # "wygeneruj jeszcze raz, moze wyjdzie lepiej" nie dziala w ogole.
+    # ⛔ NULL = A RANDOM SEED, and that is the intended default. A fixed seed gives the
+    # same file down to the byte — and then "generate again, maybe it comes out
+    # better" does not work at all.
     vox_seed = Column(Integer)
-    # KWANTYZACJA WAG — dwa NIEZALEZNE pliki, wiec dwa pola.
-    # base_lm  q8 | f16 | f32   — czesc jezykowa
-    # akustyka f16 | f32        — AudioVAE, czyli to, co lepi fale. Upstream
-    #                             PyTorch trzyma go w float32, konwerter GGUF
-    #                             zapisal F16 „dla oszczednosci pamieci".
+    # WEIGHT PRECISION — two INDEPENDENT fields.
+    # base_lm  q8 | f16    — the language part (BaseLM)
+    # acoustic f16 | f32   — the rest of the generator (ResidualLM, LocEnc, DiT)
     vox_base_lm = Column(String, nullable=False, default="q8")
-    vox_akustyka = Column(String, nullable=False, default="f16")
-    # backend silnika audio.cpp: hip | vulkan — osobne binarki, zmiana = restart gospodarza
+    vox_acoustic = Column(String, nullable=False, default="f16")
+    # audio.cpp engine backend: hip | vulkan — separate binaries, a change = an engine restart
     vox_backend = Column(String, nullable=False, default="vulkan")
-    # OmniVoice: q8 (q8_0, domyslny upstreamu) | f16 — gotowe GGUF-y z HF audio-cpp
-    omni_wagi = Column(String, nullable=False, default="q8")
-    # OmniVoice: flash attention (perf_mode) + wlasne suwaki; NULL = default upstreamu
+    # OmniVoice: q8 (q8_0, upstream's default) | f16 — ready GGUFs from HF audio-cpp
+    omni_weights = Column(String, nullable=False, default="q8")
+    # OmniVoice: flash attention (perf_mode) + its own sliders; NULL = upstream's default
     omni_flash = Column(Boolean, nullable=False, default=True)
     omni_cfg = Column(Float)
-    omni_kroki = Column(Integer)
+    omni_steps = Column(Integer)
     omni_seed = Column(Integer)
-    # pseudo-strumien OmniVoice: brak | linie (endline) | zdania (tag_aware); znaki NULL = 160
-    omni_chunk_tryb = Column(String, nullable=False, default="brak")
-    omni_chunk_znaki = Column(Integer)
-    # tempo mowy OmniVoice (`speed`); NULL = 1,0 upstreamu
-    omni_tempo = Column(Float)
-    # ZIARNISTOSC STRUMIENIA — jedyne dwa pokretla, ktorych NIE czyta backend.
-    # Silnik bierze je przez `getenv` przy PIERWSZYM przebiegu strumienia i
-    # zamraza w `static const` (`voxcpm2_runtime.cpp`,
-    # `decode_streaming_from_ready_state`), wiec zmiana wymaga przeladowania
-    # serwera — tak samo jak wagi.
-    # stream_min  ile krokow uzbierac PRZED pierwszym kawalkiem
-    # stream_co   co ile krokow leca nastepne
-    # Krok to ~0,17 s dzwieku (zmierzone 15.09: min=12 -> pierwszy kawalek 2,08 s).
+    # OmniVoice pseudo-stream: none | lines (endline) | sentences (tag_aware); chars NULL = 160
+    omni_chunk_mode = Column(String, nullable=False, default="none")
+    omni_chunk_chars = Column(Integer)
+    # OmniVoice speech rate (`speed`); NULL = upstream's 1.0
+    omni_speed = Column(Float)
+    # STREAM GRANULARITY — shown in the panel; the audio.cpp engine does not use it
+    # (it emits a chunk per patch).
+    # stream_min    how many steps to gather BEFORE the first chunk
+    # stream_every  how many steps per following chunk
+    # A step is ~0.17 s of sound.
     vox_stream_min = Column(Integer, nullable=False, default=12)
-    vox_stream_co = Column(Integer, nullable=False, default=16)
-    # WHISPER (whisper.cpp, `services/whisper_serwer.py`) — ktory model bierze
-    # dyktafon, w jakiej kwantyzacji i na czym. Domyslne = whisper z hosta
-    # sprzed 30.09 (large-v3 q5 na karcie).
+    vox_stream_every = Column(Integer, nullable=False, default=16)
+    # WHISPER (whisper.cpp, `services/whisper_host.py`) — which model the dictation
+    # uses, in which quantization and on what.
     whisper_model = Column(String, nullable=False, default="large")
-    whisper_kwant = Column(String, nullable=False, default="q5")
-    whisper_urzadzenie = Column(String, nullable=False, default="gpu")
-    # Czy backend laduje whispera sam przy starcie (w tle, z wyborem wyzej).
-    whisper_przy_starcie = Column(Boolean, nullable=False, default=False)
+    whisper_quant = Column(String, nullable=False, default="q5")
+    whisper_device = Column(String, nullable=False, default="gpu")
+    # Whether the backend loads whisper by itself at startup (in the background, with the choice above).
+    whisper_on_startup = Column(Boolean, nullable=False, default=False)
     whisper_fa = Column(Boolean, nullable=False, default=True)
+    # True = the Offloader is off, models of different engines may share the card.
+    keep_all_models = Column(Boolean, nullable=False, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

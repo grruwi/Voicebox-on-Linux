@@ -29,12 +29,12 @@ _offline_refcount = 0
 
 
 def _tf_hub():
-    """``transformers.utils.hub``, ale TYLKO jesli juz siedzi w procesie.
+    """``transformers.utils.hub``, but ONLY if it is already in the process.
 
-    ⭐ Import wciagnalby tu 900 MB torcha przy KAZDYM ladowaniu modelu — takze
-    przy silnikach ggml/ONNX, ktore transformers w ogole nie uzywaja. Gdy modul
-    nie jest zaladowany, nie ma czego przestawiac: transformers przy swoim
-    imporcie odczyta `HF_HUB_OFFLINE` ze srodowiska, ktore ustawiamy obok.
+    ⭐ Importing it here would pull in 900 MB of torch on EVERY model load — also
+    for ggml/ONNX engines that never use transformers. When the module is not
+    loaded there is nothing to switch: on its own import transformers reads
+    `HF_HUB_OFFLINE` from the environment, which we set alongside.
     """
     return sys.modules.get("transformers.utils.hub")
 _saved_env: Optional[str] = None
@@ -270,20 +270,19 @@ def ensure_original_qwen_config_cached():
 
 
 # --------------------------------------------------------------------------
-# Latka na transformers — ZAWIESZONA, nie odpalana od razu
+# The transformers patch — DEFERRED, not applied right away
 # --------------------------------------------------------------------------
 #
-# ⭐ `patch_transformers_mistral_regex()` musiala kiedys importowac
-# transformers, zeby cokolwiek zalatac — a transformers ciagnie torcha, czyli
-# ~900 MB RAM przy samym starcie Voiceboxa. Latka jest potrzebna PRZED
-# pierwszym tokenizerem, nie przed pierwszym requestem, wiec wpinamy sie w
-# maszynerie importu: dopiero gdy ktos naprawde zaimportuje
-# `transformers.tokenization_utils_base`, haczyk odpala latke i sam sie
-# wypina. Silniki ggml/ONNX nie dotykaja transformers i nigdy jej nie obudza.
+# ⭐ `patch_transformers_mistral_regex()` used to import transformers to patch
+# anything — and transformers pulls in torch, i.e. ~900 MB of RAM at Voicebox's
+# very start. The patch is needed BEFORE the first tokenizer, not before the first
+# request, so we hook into the import machinery: only when someone really imports
+# `transformers.tokenization_utils_base` does the hook apply the patch and remove
+# itself. ggml/ONNX engines never touch transformers and never wake it.
 
 
 class _LoaderProxy:
-    """Prawdziwy loader + jedno wywolanie zwrotne po wykonaniu modulu."""
+    """The real loader + one callback after the module has executed."""
 
     def __init__(self, loader, callback: Callable[[], None]):
         self._loader = loader
@@ -296,29 +295,29 @@ class _LoaderProxy:
         self._loader.exec_module(module)
         self._callback()
 
-    def __getattr__(self, nazwa):
-        return getattr(self._loader, nazwa)
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
 
 
-class _LatkaPoImporcie:
-    """Finder, ktory nie laduje niczego sam — tylko doszywa callback do modulu."""
+class _PatchAfterImport:
+    """A finder that loads nothing itself — it only attaches a callback to the module."""
 
-    def __init__(self, cel: str, callback: Callable[[], None]):
-        self._cel = cel
+    def __init__(self, target: str, callback: Callable[[], None]):
+        self._target = target
         self._callback = callback
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != self._cel:
+        if fullname != self._target:
             return None
-        # Pytamy reszte meta_path o prawdziwy spec — bez siebie, zeby nie
-        # wpasc w nieskonczona petle.
+        # Ask the rest of meta_path for the real spec — without ourselves, so as
+        # not to fall into an endless loop.
         for finder in list(sys.meta_path):
             if finder is self:
                 continue
-            znajdz = getattr(finder, "find_spec", None)
-            if znajdz is None:
+            find = getattr(finder, "find_spec", None)
+            if find is None:
                 continue
-            spec = znajdz(fullname, path, target)
+            spec = find(fullname, path, target)
             if spec is not None:
                 break
         else:
@@ -326,10 +325,10 @@ class _LatkaPoImporcie:
 
         if spec.loader is None:
             return spec
-        spec.loader = _LoaderProxy(spec.loader, self._odpal)
+        spec.loader = _LoaderProxy(spec.loader, self._fire)
         return spec
 
-    def _odpal(self):
+    def _fire(self):
         try:
             sys.meta_path.remove(self)
         except ValueError:
@@ -338,15 +337,15 @@ class _LatkaPoImporcie:
 
 
 def schedule_transformers_mistral_regex_patch() -> None:
-    """Zawiesza latke na transformers zamiast importowac je na starcie."""
-    cel = "transformers.tokenization_utils_base"
-    if cel in sys.modules:
+    """Defers the transformers patch instead of importing transformers at startup."""
+    target = "transformers.tokenization_utils_base"
+    if target in sys.modules:
         patch_transformers_mistral_regex()
         return
-    if any(isinstance(f, _LatkaPoImporcie) for f in sys.meta_path):
+    if any(isinstance(f, _PatchAfterImport) for f in sys.meta_path):
         return
-    sys.meta_path.insert(0, _LatkaPoImporcie(cel, patch_transformers_mistral_regex))
-    logger.debug("latka mistral-regex zawieszona do importu %s", cel)
+    sys.meta_path.insert(0, _PatchAfterImport(target, patch_transformers_mistral_regex))
+    logger.debug("mistral-regex patch deferred until %s is imported", target)
 
 
 if os.environ.get("VOICEBOX_OFFLINE_PATCH", "1") != "0":

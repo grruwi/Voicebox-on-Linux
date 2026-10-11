@@ -71,21 +71,7 @@ export interface GenerationRequest {
   language: LanguageCode;
   seed?: number;
   model_size?: '1.7B' | '0.6B' | '1B' | '3B';
-  engine?:
-    | 'qwen'
-    | 'qwen_custom_voice'
-    | 'voxcpm'
-    | 'omnivoice'
-    | 'voxcpm_pt'
-    | 'fish_s2_pt'
-    | 'fish_s2'
-    | 'fish_s1'
-    | 'luxtts'
-    | 'chatterbox'
-    | 'chatterbox_turbo'
-    | 'tada'
-    | 'kokoro'
-    | 'supertonic';
+  engine?: TtsEngine;
   /** Built-in voice of a preset engine; overrides the one stored in the profile. */
   preset_voice_id?: string;
   instruct?: string;
@@ -255,117 +241,124 @@ export interface GenerationSettings {
   crossfade_ms: number;
   normalize_audio: boolean;
   autoplay_on_generate: boolean;
-  /** Jak sztywno VoxCPM2 trzyma się nawiasu sterującego. */
+  /** How strictly VoxCPM2 follows the steering parentheses. */
   vox_cfg: number;
-  vox_base_lm?: VoxWariant;
-  vox_akustyka?: VoxAkustyka;
-  /** Backend silnika audio.cpp — osobne binarki, zmiana = przeładowanie. */
+  vox_base_lm?: VoxBaseLm;
+  vox_acoustic?: VoxAcoustic;
+  /** The audio.cpp engine's backend — separate binaries, a change = a reload. */
   vox_backend?: VoxBackend;
-  /** OmniVoice: gotowy GGUF z upstreamu — q8 (domyślny upstreamu) albo f16. */
-  omni_wagi?: OmniWagi;
-  /** OmniVoice: flash attention (perf_mode) — domyślnie włączony. */
+  /** OmniVoice: upstream's ready GGUF — q8 (upstream's default) or f16. */
+  omni_weights?: OmniWeights;
+  /** OmniVoice: flash attention (perf_mode) — on by default. */
   omni_flash?: boolean;
-  /** Własne suwaki OmniVoice; `null` = default upstreamu (2,0 / 32 / losowo). */
+  /** OmniVoice's own sliders; `null` = upstream's default (2.0 / 32 / random). */
   omni_cfg?: number | null;
-  omni_kroki?: number | null;
+  omni_steps?: number | null;
   omni_seed?: number | null;
-  /** Pseudo-strumień: brak | linie (endline) | zdania (tag_aware). */
-  omni_chunk_tryb?: 'brak' | 'linie' | 'zdania';
-  /** Maks. znaków w kawałku; `null` = 160 (przykład strumienia z docs upstreamu). */
-  omni_chunk_znaki?: number | null;
-  /** Tempo mowy OmniVoice (`speed`); `null` = 1,0 upstreamu. */
-  omni_tempo?: number | null;
-  /** Kroki dyfuzji: 30 do próbek referencyjnych, 10 do gadania, 8 to próg. */
+  /** Pseudo-streaming: none | lines (endline) | sentences (tag_aware). */
+  omni_chunk_mode?: 'none' | 'lines' | 'sentences';
+  /** Max characters per chunk; `null` = 160 (the streaming example in upstream's docs). */
+  omni_chunk_chars?: number | null;
+  /** OmniVoice speech speed (`speed`); `null` = upstream's 1.0. */
+  omni_speed?: number | null;
+  /** Diffusion steps: 30 for reference samples, 10 for chatting, 8 is the floor. */
   vox_timesteps: number;
-  /** Temperatura szumu w dyfuzji. 1.0 = wartość silnika. */
+  /** Noise temperature in the diffusion. 1.0 = the engine's value. */
   vox_temperature: number;
-  /** Ziarno losowe. `null` = za każdym razem inaczej (tak ma być domyślnie). */
+  /** Random seed. `null` = different every time (the intended default). */
   vox_seed: number | null;
-  /** Ile kroków dekodera uzbierać PRZED pierwszym kawałkiem strumienia.
-   *  Krok to ~0,17 s dźwięku, więc to wprost cisza przed pierwszym słowem. */
+  /** How many decoder steps to collect BEFORE the first stream chunk.
+   *  A step is ~0.17 s of sound, so this is directly the silence before the first word. */
   vox_stream_min?: number;
-  /** Co ile kroków lecą kolejne kawałki — czyli jak grube są porcje. */
-  vox_stream_co?: number;
-  /** Whisper (whisper.cpp): model dyktafonu, kwantyzacja, karta albo procesor. */
+  /** Every how many steps the next chunks go out — i.e. how thick the portions are. */
+  vox_stream_every?: number;
+  /** Whisper (whisper.cpp): the dictation model, quantization, GPU or CPU. */
   whisper_model?: WhisperModel;
-  whisper_kwant?: WhisperKwant;
-  whisper_urzadzenie?: WhisperUrzadzenie;
-  /** Backend ładuje whispera sam przy starcie (w tle, z wyborem wyżej). */
-  whisper_przy_starcie?: boolean;
-  /** Flash attention whisper-servera — domyślnie włączony. */
+  whisper_quant?: WhisperQuant;
+  whisper_device?: WhisperDevice;
+  /** Whisper loads by itself when its container starts (with the choice above). */
+  whisper_on_startup?: boolean;
+  /** whisper-server flash attention — on by default. */
   whisper_fa?: boolean;
+  /** true = the Offloader is off, models of different engines may share the card. */
+  keep_all_models?: boolean;
 }
 
-export type WhisperModel = 'medium' | 'large' | 'turbo';
-export type WhisperKwant = 'q5' | 'q8';
-export type WhisperUrzadzenie = 'gpu' | 'cpu';
+/** The TTS engines of this build. */
+export type TtsEngine = 'voxcpm' | 'voxcpm_pt' | 'omnivoice';
 
-/** Stan procesu `whisper-server`. `zaladowany_*` czytane z /proc, nie z ustawień. */
-export interface WhisperStan {
-  chodzi: boolean;
-  zaladowany_model: WhisperModel | null;
-  zaladowany_kwant: WhisperKwant | null;
-  zaladowane_urzadzenie: WhisperUrzadzenie | null;
-  zaladowany_fa?: boolean | null;
-  wybrany_fa?: boolean;
-  wybrany_model: WhisperModel;
-  wybrany_kwant: WhisperKwant;
-  wybrane_urzadzenie: WhisperUrzadzenie;
-  pliki: {
+export type WhisperModel = 'medium' | 'large' | 'turbo';
+export type WhisperQuant = 'q5' | 'q8';
+export type WhisperDevice = 'gpu' | 'cpu';
+
+/** The `whisper` container's state. `loaded_*` = what the process REALLY holds, not the settings. */
+export interface WhisperState {
+  loaded: boolean;
+  /** false = the `whisper` container does not answer */
+  container: boolean;
+  loaded_model: WhisperModel | null;
+  loaded_quant: WhisperQuant | null;
+  loaded_device: WhisperDevice | null;
+  loaded_fa?: boolean | null;
+  selected_fa?: boolean;
+  selected_model: WhisperModel;
+  selected_quant: WhisperQuant;
+  selected_device: WhisperDevice;
+  files: {
     model: WhisperModel;
-    kwant: WhisperKwant;
-    plik: string;
-    jest_na_dysku: boolean;
-    rozmiar_mib: number;
+    quant: WhisperQuant;
+    file: string;
+    on_disk: boolean;
+    size_mib: number;
   }[];
   ms?: number | null;
 }
 
 export type GenerationSettingsUpdate = Partial<GenerationSettings>;
 
-/** Część językowa VoxCPM2: q8 — 1,6 GB, szybszy; f16 — 3,0 GB; f32 — 6,0 GB. */
-export type VoxWariant = 'q8' | 'f16' | 'f32';
-/** AudioVAE, czyli to, co lepi falę. Wariantu q8 nie ma. */
-export type VoxAkustyka = 'f16' | 'f32';
-/** ROCm (HIP) albo Vulkan (RADV) — która binarka audio.cpp liczy głos. */
+/** VoxCPM2's language part: q8 — 1.6 GB, faster; f16 — 3.0 GB. */
+export type VoxBaseLm = 'q8' | 'f16';
+/** The rest of the generator (AudioVAE shapes the wave). There is no q8. */
+export type VoxAcoustic = 'f16' | 'f32';
+/** ROCm (HIP) or Vulkan (RADV) — which audio.cpp binary computes the voice. */
 export type VoxBackend = 'hip' | 'vulkan';
-/** OmniVoice — plik wag: q8 (q8_0, 1,3 GB) albo f16 (1,6 GB). */
-export type OmniWagi = 'q8' | 'f16';
+/** OmniVoice weights file: q8 (q8_0, 1.3 GB) or f16 (1.6 GB). */
+export type OmniWeights = 'q8' | 'f16';
 
-export interface WariantWag {
-  klucz: string;
-  plik: string;
-  jest_na_dysku: boolean;
-  rozmiar_mib: number;
+export interface WeightVariant {
+  key: string;
+  file: string;
+  on_disk: boolean;
+  size_mib: number;
 }
 
-/** Stan procesu `llama-tts-server`. `zaladowany_*` to wagi, które FAKTYCZNIE
- *  trzyma — czytane z /proc, nie z ustawień. */
-export interface TtsStan {
-  dostepny: boolean;
-  chodzi: boolean;
-  wariant: VoxWariant | null;
+/** The voice engines' state. `loaded_*` = what the engine REALLY holds, `selected_*` =
+ *  what the panel picked; they differ until a reload. */
+export interface TtsState {
+  /** false = no audio.cpp engine configured at all */
+  available: boolean;
+  vox_loaded: boolean;
+  /** How long the last (re)load took — only in reload replies. */
   ms?: number | null;
-  zaladowany_base_lm?: VoxWariant | null;
-  zaladowany_akustyka?: VoxAkustyka | null;
-  wybrany_base_lm?: VoxWariant | null;
-  wybrany_akustyka?: VoxAkustyka | null;
-  zaladowany_backend?: VoxBackend | null;
-  wybrany_backend?: VoxBackend | null;
-  /** OmniVoice siedzi w tym samym silniku — jeden model naraz, więc albo on, albo vox. */
-  omni_chodzi?: boolean;
-  zaladowany_omni?: OmniWagi | null;
-  zaladowany_omni_flash?: boolean | null;
-  wybrany_omni?: OmniWagi | null;
-  omni?: WariantWag[];
-  base_lm?: WariantWag[];
-  akustyka?: WariantWag[];
-  /** Ziarnistość, z którą serwer FAKTYCZNIE wstał — z /proc/<pid>/environ,
-   *  bo te dwie liczby idą środowiskiem, nie argumentem wiersza poleceń. */
-  zaladowany_stream_min?: number | null;
-  zaladowany_stream_co?: number | null;
-  wybrany_stream_min?: number | null;
-  wybrany_stream_co?: number | null;
+  loaded_base_lm?: VoxBaseLm | null;
+  loaded_acoustic?: VoxAcoustic | null;
+  selected_base_lm?: VoxBaseLm | null;
+  selected_acoustic?: VoxAcoustic | null;
+  loaded_backend?: VoxBackend | null;
+  selected_backend?: VoxBackend | null;
+  /** OmniVoice lives in the same engine — one model at a time, so either it or Vox. */
+  omni_loaded?: boolean;
+  loaded_omni?: OmniWeights | null;
+  loaded_omni_flash?: boolean | null;
+  selected_omni?: OmniWeights | null;
+  omni?: WeightVariant[];
+  base_lm?: WeightVariant[];
+  acoustic?: WeightVariant[];
+  /** Stream granularity the engine REALLY started with vs the panel's. */
+  loaded_stream_min?: number | null;
+  loaded_stream_every?: number | null;
+  selected_stream_min?: number | null;
+  selected_stream_every?: number | null;
 }
 
 export interface TranscriptionRequest {
@@ -679,23 +672,22 @@ export interface CloudStatus {
   dashboard_url: string;
 }
 
-// ── wybor karty graficznej dla modeli ───────────────────────────────────────
-// `wybrana` to zapis w pliku, `aktywna` to co widzi ZYWY proces backendu.
-// Rozjazd = ktos kliknal i nie zrestartowal jeszcze Voiceboxa.
-export interface KartaGpu {
-  indeks: number;
+// ── the GPU for the models ────────────────────────────────────────────────────
+// The choice is stored as a PCI address and takes effect with the next model load
+// (the engine containers start each model with the visibility variables).
+export interface GpuCard {
+  index: number;
   pci: string;
-  nazwa: string;
+  name: string;
   vram_mib: number;
 }
 
-export interface StanKarty {
-  karty: KartaGpu[];
-  wybrana: number | null;
-  aktywna: number | null;
-  /** Karta, którą silniki dostaną po restarcie — po wyjęciu karty lub przenosinach ≠ `wybrana`. */
-  rozwiazana: number | null;
-  /** Skąd ten wybór, po ludzku. */
-  powod: string;
-  wymaga_restartu: boolean;
+export interface GpuState {
+  cards: GpuCard[];
+  /** What the file holds (a PCI address); null = every card visible. */
+  selected_pci: string | null;
+  /** The card the engines get on THIS machine — after a card is pulled or a move it may differ. */
+  resolved: number | null;
+  /** Where this choice comes from, in plain words. */
+  reason: string;
 }

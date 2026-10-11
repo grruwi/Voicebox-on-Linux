@@ -24,7 +24,7 @@ import traceback
 from typing import Literal, Optional
 
 from .. import config
-from . import history, pamiec, profiles, strumien_przegladarki
+from . import browser_stream, history, memory, profiles
 from ..database import get_db
 from ..utils.tasks import get_task_manager
 
@@ -74,8 +74,8 @@ async def run_generation(
 
         await load_engine_model(engine, model_size)
 
-        # ⏱ ZEGAR DIAGNOSTYCZNY (16.08, tymczasowy — do zdjecia po ustaleniu,
-        # gdzie siedzi staly narzut generacji). Log: "[ZEGAR] ...".
+        # ⏱ A DIAGNOSTIC CLOCK — where the fixed overhead of a generation sits.
+        # Log: "[TIMING] ...".
         _t0 = time.perf_counter()
 
         voice_prompt = await profiles.create_voice_prompt_for_profile(
@@ -103,52 +103,50 @@ async def run_generation(
         if crossfade_ms is not None:
             gen_kwargs["crossfade_ms"] = crossfade_ms
 
-        # ⭐ STRUMIEN — dzwiek leci na glosniki W TRAKCIE liczenia, zamiast po.
-        # Zmierzone: pierwszy dzwiek po 0,25 s zamiast po calosci. ⚠️ CALKOWITY
-        # CZAS SIE NIE ZMIENIA — to nie jest przyspieszenie, tylko skrocenie
-        # ciszy przed pierwszym slowem.
+        # ⭐ STREAMING — the sound goes out WHILE it is computed, not after.
+        # Measured: first sound after 0.25 s instead of after the whole thing. ⚠️ THE TOTAL
+        # TIME DOES NOT CHANGE — it is not a speed-up, only less silence before the first word.
         #
-        # Kazdy warunek nizej odpada, bo POTRZEBUJE CALEGO PRZEBIEGU:
-        #   normalize / effects_chain — licza sie na komplecie probek,
-        #   retry / regenerate        — nadpisuja istniejaca wersje,
-        #   dlugi tekst              — `generate_chunked` tnie go i skleja z
-        #                              przenikaniem, czego strumien nie robi.
-        # Silnik bez `generate_stream` po prostu tu nie wchodzi — zaden inny
-        # backend nie wymagal zmian.
+        # Every condition below drops out because it NEEDS THE WHOLE TAKE:
+        #   normalize / effects_chain — computed on all the samples,
+        #   retry / regenerate        — overwrite an existing version,
+        #   long text                 — `generate_chunked` cuts it and joins the pieces
+        #                               with a crossfade, which the stream does not do.
+        # An engine without `generate_stream` simply does not come in here.
         audio = None
-        zagrane_strumieniem = False
-        strumieniowalne = (
+        streamed = False
+        streamable = (
             mode == "generate"
             and not normalize
             and not effects_chain
             and hasattr(tts_model, "generate_stream")
             and len(text) <= (max_chunk_chars or 800)
-            and not _zrodlo_openai(generation_id, bg_db)
+            and not _source_is_openai(generation_id, bg_db)
         )
-        twitch = strumieniowalne and _zrodlo_twitch(generation_id, bg_db)
-        do_glosnikow = strumieniowalne and (
-            _zrodlo_jest_agenta(generation_id, bg_db)
+        twitch = streamable and _source_is_twitch(generation_id, bg_db)
+        to_speakers = streamable and (
+            _source_is_agent(generation_id, bg_db)
             or twitch
-            or not _front_zagra_sam(bg_db)
+            or not _frontend_plays_itself(bg_db)
         )
-        # ⭐ AUTOPLAY ZAZNACZONY (11.10, grruwi) = generacja z GUI leci strumieniem do
-        # PRZEGLADARKI, nie do `ffplay` — panel gra kawalki w miare liczenia, zamiast
-        # pliku po calosci (`services/strumien_przegladarki.py`). Odznaczony = ffplay.
-        do_przegladarki = strumieniowalne and not do_glosnikow
-        if do_glosnikow or do_przegladarki:
-            audio, sample_rate = await _graj_strumieniem(
+        # ⭐ AUTOPLAY CHECKED (11.10, grruwi) = a generation from the GUI streams to the
+        # BROWSER, not to `ffplay` — the panel plays the chunks as they are made, instead
+        # of the file after the whole thing (`services/browser_stream.py`). Unchecked = ffplay.
+        to_browser = streamable and not to_speakers
+        if to_speakers or to_browser:
+            audio, sample_rate = await _play_streaming(
                 tts_model,
                 text,
                 voice_prompt,
                 language=language,
                 seed=seed,
                 instruct=instruct,
-                env=_env_odtwarzacza(twitch),
-                przegladarka=generation_id if do_przegladarki else None,
+                env=_player_env(twitch),
+                browser=generation_id if to_browser else None,
             )
-            zagrane_strumieniem = audio is not None
+            streamed = audio is not None
         else:
-            strumien_przegladarki.odmow(generation_id)
+            browser_stream.refuse(generation_id)
 
         if audio is None:
             audio, sample_rate = await generate_chunked(tts_model, text, voice_prompt, **gen_kwargs)
@@ -190,8 +188,8 @@ async def run_generation(
 
         _t4 = time.perf_counter()
         logger.info(
-            "[ZEGAR] audio=%.2fs | referencja=%.2f  inferencja=%.2f  "
-            "normalizacja=%.2f  zapis+efekty=%.2f  RAZEM=%.2f",
+            "[TIMING] audio=%.2fs | reference=%.2f  inference=%.2f  "
+            "normalize=%.2f  save+effects=%.2f  TOTAL=%.2f",
             duration, _t1 - _t0, _t2 - _t1, _t3 - _t2, _t4 - _t3, _t4 - _t0,
         )
 
@@ -221,90 +219,78 @@ async def run_generation(
         )
         _notify_speak_end(generation_id, status="failed")
     else:
-        # ⛔ Nie gramy drugi raz tego, co juz poszlo strumieniem na glosniki.
-        if not zagrane_strumieniem:
-            # ⚠️ Przy ZGASZONYM autoplay front nie gra NICZEGO — wiec generacja,
-            # ktora wypadla ze strumienia (za dlugi tekst, efekty, normalizacja,
-            # silnik bez `generate_stream`), skonczylaby CISZA. Wtedy gramy plik
-            # z backendu, tak samo jak mowe agenta.
+        # ⛔ Do not play a second time what already went to the speakers as a stream.
+        if not streamed:
+            # ⚠️ With autoplay UNCHECKED the frontend plays NOTHING — so a generation that
+            # dropped out of streaming (text too long, effects, normalize, an engine without
+            # `generate_stream`) would end in SILENCE. Then the backend plays the file, the
+            # same as an agent's speech.
             _autoplay_if_agent(
                 generation_id, final_path, bg_db,
-                takze_z_gui=not _front_zagra_sam(bg_db),
+                also_from_gui=not _frontend_plays_itself(bg_db),
             )
         _notify_speak_end(generation_id, status="completed")
     finally:
         task_manager.complete_generation(generation_id)
         bg_db.close()
-        # Oddaj cache alokatora — model zostaje, znika tylko narosly zapas.
-        # Bez tego jedyna droga do odzyskania VRAM jest wyrzucenie wag.
-        pamiec.zwolnij_pamiec("run_generation")
+        # Give the allocator cache back — the model stays, only the grown reserve goes.
+        memory.release_memory("run_generation")
 
 
-def _front_zagra_sam(db) -> bool:
-    """Czy przegladarka odtworzy ten plik po zakonczeniu generacji.
+def _frontend_plays_itself(db) -> bool:
+    """Whether the browser plays this file once the generation is done.
 
-    ⚠️ To decyduje, czy strumien wolno puscic przy kliknieciu w GUI. Strumien
-    gra z BACKENDU przez `ffplay`; gdyby front zagral to samo z pliku, dzwiek
-    poszedlby DWA RAZY. Przy zgaszonym „autoplay on generate" front milczy,
-    wiec strumien jest jedynym zrodlem i echa nie ma.
-
-    ⛔ Cena zgaszonego autoplay: silnik BEZ `generate_stream` (vox ggml, S1)
-    nie zagra z GUI wcale — plik laduje w historii i trzeba go kliknac.
+    ⚠️ This decides whether a click in the GUI may stream to the speakers. That stream
+    plays from the BACKEND through `ffplay`; if the frontend played the same file, the
+    sound would go TWICE. With "autoplay on generate" unchecked the frontend stays silent,
+    so the stream is the only source and there is no echo.
     """
     try:
         from ..database.models import GenerationSettings
 
-        ustawienia = db.query(GenerationSettings).first()
-        return bool(ustawienia.autoplay_on_generate) if ustawienia else True
+        settings = db.query(GenerationSettings).first()
+        return bool(settings.autoplay_on_generate) if settings else True
     except Exception:
-        return True  # w razie watpliwosci NIE gramy z backendu — echo gorsze niz cisza
+        return True  # when in doubt the backend does NOT play — an echo is worse than silence
 
 
-def _zrodlo_jest_agenta(generation_id: str, db) -> bool:
-    """Czy to mowa agenta (MCP/REST), czy klikniecie w GUI.
+def _source(generation_id: str, db) -> Optional[str]:
+    try:
+        from ..database.models import Generation as DBGeneration
 
-    Front gra swoje sam, wiec strumien na glosniki dotyczy tylko tego pierwszego.
+        row = db.query(DBGeneration).filter_by(id=generation_id).first()
+        return row.source if row else None
+    except Exception:
+        return None
+
+
+def _source_is_agent(generation_id: str, db) -> bool:
+    """An agent's speech (MCP/REST) or a click in the GUI.
+
+    The frontend plays its own, so streaming to the speakers concerns the former only.
     """
-    try:
-        from ..database.models import Generation as DBGeneration
-
-        wiersz = db.query(DBGeneration).filter_by(id=generation_id).first()
-        return bool(wiersz and wiersz.source in ("mcp", "rest"))
-    except Exception:
-        return False
+    return _source(generation_id, db) in ("mcp", "rest")
 
 
-# ⭐ ZRODLO "twitch" (2026-09-29): TTS widzow z /klocki/stream-hub/twitch-tts.
-# Gra tym samym strumieniem co mowa agenta (TTFT ~0,3 s), ale na KANALE
-# "Twitch TTS", nie na domyslnym. Dwie zmienne dla ffplay (klient pulse):
-#   PULSE_SINK        — na ktory sink
-#   PULSE_PROP        — wlasna nazwa, bo klodzio-audio-router przeklada kazdy
-#                       node "ffplay" na kanal Klodzia, czyli do "System"
-# Bez tego TTS lecial podwojnie: raz systemem, raz swoim kanalem.
-def _zrodlo_twitch(generation_id: str, db) -> bool:
-    try:
-        from ..database.models import Generation as DBGeneration
-
-        wiersz = db.query(DBGeneration).filter_by(id=generation_id).first()
-        return bool(wiersz and wiersz.source == "twitch")
-    except Exception:
-        return False
+# ⭐ SOURCE "twitch" (2026-09-29): viewers' TTS from stream-hub/twitch-tts. Plays with the
+# same stream as an agent's speech (TTFT ~0.3 s), but on the "Twitch TTS" CHANNEL, not the
+# default one. Two variables for ffplay (a pulse client):
+#   PULSE_SINK        — which sink
+#   PULSE_PROP        — its own name, because klodzio-audio-router moves every "ffplay"
+#                       node to Klodzio's channel, i.e. to "System"
+# Without them the TTS went out twice: once through the system, once on its own channel.
+def _source_is_twitch(generation_id: str, db) -> bool:
+    return _source(generation_id, db) == "twitch"
 
 
-# ⛔ ZRODLO "openai" (2026-10-01): /v1/audio/speech dla WebUI i Newelle.
-# Plik wraca do klienta w odpowiedzi HTTP, a przegladarka moze stac na
-# telefonie — glosniki kombajnu maja milczec, takze przy zgaszonym autoplay.
-def _zrodlo_openai(generation_id: str, db) -> bool:
-    try:
-        from ..database.models import Generation as DBGeneration
-
-        wiersz = db.query(DBGeneration).filter_by(id=generation_id).first()
-        return bool(wiersz and wiersz.source == "openai")
-    except Exception:
-        return False
+# ⛔ SOURCE "openai" (2026-10-01): /v1/audio/speech for WebUI and Newelle. The file goes
+# back to the client in the HTTP response, and the browser may be on a phone — the
+# machine's speakers stay silent, also with autoplay unchecked.
+def _source_is_openai(generation_id: str, db) -> bool:
+    return _source(generation_id, db) == "openai"
 
 
-def _env_odtwarzacza(twitch: bool):
+def _player_env(twitch: bool):
     if not twitch:
         return None
     import os
@@ -313,7 +299,7 @@ def _env_odtwarzacza(twitch: bool):
             "PULSE_PROP": "application.name=twitch-tts-play"}
 
 
-async def _graj_strumieniem(
+async def _play_streaming(
     backend,
     text: str,
     voice_prompt: dict,
@@ -322,41 +308,41 @@ async def _graj_strumieniem(
     seed: int | None,
     instruct: str | None,
     env: dict | None = None,
-    przegladarka: str | None = None,
+    browser: str | None = None,
 ):
-    """Graj kawalki na glosnikach w miare powstawania; zwroc caly dzwiek.
+    """Play the chunks on the speakers as they are made; return the whole sound.
 
-    `przegladarka` = id generacji: kawalki ida do `strumien_przegladarki` (panel gra
-    je przez Web Audio) ZAMIAST do `ffplay`.
+    `browser` = the generation id: the chunks go to `browser_stream` (the panel plays
+    them through Web Audio) INSTEAD of `ffplay`.
 
-    Dwie rzeczy naraz: bajty ida do `ffplay` przez rure, a kopia laduje w
-    liscie — inaczej nie byloby czego zapisac do historii i `/audio/{id}`
-    oddawaloby pustke.
+    Two things at once: the bytes go to `ffplay` through a pipe, and a copy lands in a
+    list — otherwise there would be nothing to save to the history and `/audio/{id}`
+    would return emptiness.
 
-    ⚠️ NIGDY NIE RZUCA. Zwraca `(None, 0)`, gdy cokolwiek zawiedzie — wtedy
-    `run_generation` leci stara droga i uzytkownik dostaje dzwiek mimo wszystko.
-    Strumien jest wygoda, nie warunkiem dzialania.
+    ⚠️ NEVER RAISES. Returns `(None, 0)` when anything fails — then `run_generation` takes
+    the old road and the user gets the sound anyway. Streaming is a convenience, not a
+    condition.
 
-    ⛔ `ffplay` dostaje GOLE PROBKI, bez naglowka WAV — stad `-f f32le` i reszta
-    opisu formatu we flagach. Naglowek niesie dlugosc, ktorej na starcie nie znamy.
+    ⛔ `ffplay` gets RAW SAMPLES, no WAV header — hence `-f f32le` and the rest of the
+    format description in the flags. The header carries a length we do not know at the start.
     """
     import numpy as np
 
-    czestotliwosc = getattr(backend, "SAMPLE_RATE", 48000)
-    odtwarzacz = None
-    strumien = None
-    kawalki: list = []
+    sample_rate = getattr(backend, "SAMPLE_RATE", 48000)
+    player = None
+    stream = None
+    chunks: list = []
 
     try:
-        if przegladarka:
-            strumien = strumien_przegladarki.otworz(przegladarka, czestotliwosc)
+        if browser:
+            stream = browser_stream.open_stream(browser, sample_rate)
         else:
-            # ⛔ Bez `-probesize 32 -analyzeduration 0 -fflags nobuffer` ffplay „bada”
-            # rurę, aż uzbiera kilka sekund dźwięku, i dopiero wtedy otwiera wyjście:
-            # zmierzone 30.09 — strumień w PipeWire +3,4 s po POST, choć TTFT 0,2 s.
-            # Z flagami otwiera się 1 ms po pierwszym kawałku.
-            odtwarzacz = subprocess.Popen(
-                ["ffplay", "-f", "f32le", "-ar", str(czestotliwosc), "-ch_layout", "mono",
+            # ⛔ Without `-probesize 32 -analyzeduration 0 -fflags nobuffer` ffplay "probes"
+            # the pipe until it has a few seconds of sound, and only then opens the output:
+            # measured 30.09 — the stream in PipeWire +3.4 s after the POST, though TTFT was
+            # 0.2 s. With the flags it opens 1 ms after the first chunk.
+            player = subprocess.Popen(
+                ["ffplay", "-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "mono",
                  "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
                  "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"],
                 env=env,
@@ -365,75 +351,75 @@ async def _graj_strumieniem(
                 stderr=subprocess.DEVNULL,
             )
 
-        _t_zadanie = time.perf_counter()
-        async for kawalek in backend.generate_stream(
+        t_request = time.perf_counter()
+        async for chunk in backend.generate_stream(
             text, voice_prompt, language=language, seed=seed, instruct=instruct
         ):
-            if not kawalki:
-                # TTFT — cisza przed pierwszym slowem. Jedyna liczba, ktora
-                # decyduje, czy to jeszcze rozmowa, czy juz odczyt komunikatu.
+            if not chunks:
+                # TTFT — the silence before the first word. The one number that decides
+                # whether this is still a conversation or already reading an announcement.
                 logger.info(
-                    "[ZEGAR] TTFT=%.3fs | znakow=%d",
-                    time.perf_counter() - _t_zadanie, len(text),
+                    "[TIMING] TTFT=%.3fs | chars=%d",
+                    time.perf_counter() - t_request, len(text),
                 )
-            kawalki.append(kawalek)
-            if strumien is not None:
-                strumien.dodaj(kawalek.tobytes())
+            chunks.append(chunk)
+            if stream is not None:
+                stream.add(chunk.tobytes())
                 continue
             try:
-                # ⛔ W WATKU, nie wprost. Rura do ffplay ma ~64 KB (0,3 s dzwieku),
-                # a ffplay czyta w tempie odtwarzania — `write` blokuje, az dogra.
-                # Wprost w petli zdarzen zamrazalo to CALY backend na czas mowy:
-                # dyktafon dostawal timeout, /transcribe czekal (zmierzone 30.09).
-                await asyncio.to_thread(odtwarzacz.stdin.write, kawalek.tobytes())
+                # ⛔ IN A THREAD, not directly. The pipe to ffplay holds ~64 KB (0.3 s of
+                # sound), and ffplay reads at playback speed — `write` blocks until it has
+                # played. Directly on the event loop this froze the WHOLE backend for the
+                # length of the speech: the dictation timed out, /transcribe waited
+                # (measured 30.09).
+                await asyncio.to_thread(player.stdin.write, chunk.tobytes())
             except (BrokenPipeError, ValueError):
-                # Odtwarzacz zszedl (np. ubity recznie) — liczymy dalej,
-                # zeby generacja mimo to trafila do historii.
-                odtwarzacz = None
+                # The player went away (e.g. killed by hand) — keep computing, so the
+                # generation still lands in the history.
+                player = None
                 break
 
-        if odtwarzacz is not None:
-            odtwarzacz.stdin.close()
-        if strumien is not None:
-            strumien.zakoncz()
+        if player is not None:
+            player.stdin.close()
+        if stream is not None:
+            stream.finish()
 
-        if not kawalki:
+        if not chunks:
             return None, 0
 
-        logger.info("Strumien: zagrane %d kawalkow @ %d Hz", len(kawalki), czestotliwosc)
-        return np.concatenate(kawalki), czestotliwosc
+        logger.info("Stream: played %d chunks @ %d Hz", len(chunks), sample_rate)
+        return np.concatenate(chunks), sample_rate
 
     except Exception:
-        logger.exception("Strumien nie wyszedl — wracam do zwyklej generacji")
-        if strumien is not None:
-            strumien.zakoncz(blad=True)
-        if odtwarzacz is not None:
+        logger.exception("Streaming failed — falling back to a plain generation")
+        if stream is not None:
+            stream.finish(failed=True)
+        if player is not None:
             try:
-                odtwarzacz.kill()
+                player.kill()
             except Exception:
                 pass
         return None, 0
     finally:
-        # Anulowana generacja (CancelledError nie jest Exception) — przegladarka
-        # czekalaby na kolejny kawalek w nieskonczonosc.
-        if strumien is not None and not strumien.koniec:
-            strumien.zakoncz(blad=True)
+        # A cancelled generation (CancelledError is not an Exception) — the browser would
+        # wait for the next chunk forever.
+        if stream is not None and not stream.done:
+            stream.finish(failed=True)
 
 
 def _autoplay_if_agent(
-    generation_id: str, audio_path: str | None, db, *, takze_z_gui: bool = False
+    generation_id: str, audio_path: str | None, db, *, also_from_gui: bool = False
 ) -> None:
-    """Zagraj wypowiedz agenta na glosnikach — z WNETRZA kontenera.
+    """Play an agent's speech on the speakers — from INSIDE the container.
 
-    Luka, ktora to zatyka: generacje ze zrodel agentowych ("mcp", "rest")
-    swiadomie omijaja autoplay w glownym oknie (patrz routes/generations.py),
-    bo tam gra pigulka we froncie. Bez otwartego frontu nikt ich nie gral —
-    plik ladowal na dysk i cisza.
+    The gap this closes: generations from agent sources ("mcp", "rest") skip the autoplay
+    in the main window on purpose (see routes/generations.py), because the pill in the
+    frontend plays them. With no frontend open nobody played them — the file landed on
+    disk and silence.
 
-    Warunek dzialania: socket PipeWire (w trybie zgodnosci z PulseAudio)
-    wpuszczony do kontenera przez compose jako /run/pulse/native. Bez niego
-    ffplay wychodzi bledem, ktory tu tylko logujemy — dzwiek nigdy nie moze
-    wywrocic zakonczonej generacji.
+    Condition: the PipeWire socket (in PulseAudio compatibility mode) let into the
+    container by compose as /run/pulse/native. Without it ffplay exits with an error we
+    only log — sound can never break a finished generation.
     """
     if not audio_path:
         return
@@ -445,27 +431,27 @@ def _autoplay_if_agent(
         if not row:
             return
         if row.source == "openai":
-            return  # gra klient, ktory pytal (WebUI/Newelle), nie kombajn
-        if row.source not in ("mcp", "rest", "twitch") and not takze_z_gui:
-            return  # front sam zagra swoje
+            return  # the client who asked plays it (WebUI/Newelle), not the machine
+        if row.source not in ("mcp", "rest", "twitch") and not also_from_gui:
+            return  # the frontend plays its own
 
         path = config.resolve_storage_path(audio_path)
         if not path or not path.exists():
-            logger.warning("Autoplay: brak pliku %s", audio_path)
+            logger.warning("Autoplay: no file %s", audio_path)
             return
 
-        # -nodisp: bez okna SDL. -autoexit: konczy sie razem z plikiem.
-        # Puszczamy w tle (Popen bez wait) — kolejka generacji nie ma
-        # stac przez czas mowienia.
+        # -nodisp: no SDL window. -autoexit: ends together with the file.
+        # Run in the background (Popen without wait) — the generation queue must not
+        # stand still for the length of the speech.
         subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(path)],
-            env=_env_odtwarzacza(row.source == "twitch"),
+            env=_player_env(row.source == "twitch"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        logger.info("Autoplay: gram %s", path.name)
+        logger.info("Autoplay: playing %s", path.name)
     except Exception:
-        logger.exception("Autoplay: nie udalo sie zagrac %s", generation_id)
+        logger.exception("Autoplay: could not play %s", generation_id)
 
 
 def _notify_speak_end(generation_id: str, *, status: str) -> None:
@@ -636,7 +622,7 @@ async def generate_audio_sync(
         return tts.audio_to_wav_bytes(audio, sample_rate)
     finally:
         # Druga trasa generacji (m.in. /generate/stream) — ten sam obowiazek.
-        pamiec.zwolnij_pamiec("generate_audio_sync")
+        memory.release_memory("generate_audio_sync")
 
 
 def _save_regenerate(

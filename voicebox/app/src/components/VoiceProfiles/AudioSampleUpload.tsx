@@ -2,10 +2,10 @@ import { Mic, Pause, Play, Upload } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import { type EdytorProps, PrzyciskEdytor } from './PrzyciskEdytor';
+import { type EditorProps, EditorButton } from './EditorButton';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
 
-interface AudioSampleUploadProps extends EdytorProps {
+interface AudioSampleUploadProps extends EditorProps {
   file: File | null | undefined;
   onFileChange: (file: File | undefined) => void;
   onTranscribe: () => void;
@@ -130,7 +130,7 @@ export function AudioSampleUpload({
                     <Mic className="h-4 w-4" />
                     {isTranscribing ? t('audioSample.transcribing') : t('audioSample.transcribe')}
                   </Button>
-                  <PrzyciskEdytor onEdit={onEdit} disabled={isValidating} />
+                  <EditorButton onEdit={onEdit} disabled={isValidating} />
                   <Button
                     type="button"
                     variant="outline"

@@ -142,8 +142,8 @@ const settingsRoute = createRoute({
 });
 
 // Settings sub-routes
-// Gole `/settings` przerzuca na Generation — to jedyna zakladka, ktora grruwi
-// otwiera na co dzien, a wejscie z paska bocznego ladowalo w General.
+// Bare `/settings` goes to Generation — the tab used every day; the sidebar entry
+// used to land on General.
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/',

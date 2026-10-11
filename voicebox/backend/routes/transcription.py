@@ -32,11 +32,10 @@ async def transcribe_audio(
 ):
     """Transcribe audio file to text.
 
-    `prompt` to nazwy wlasne i styl mowy podawane modelowi jako kontekst przed
-    nagraniem (odpowiednik `initial_prompt` z whisper.cpp) — bez tego dyktafon
-    gubi "Klodzio", "Gienia", "kibelek". Backendy, ktore go nie znaja, dostaja
-    zadanie bez tego pola. `carry_initial_prompt` i `max_len` ida do whisper.cpp
-    tak samo (pola dyktafonu); puste nie ida wcale.
+    `prompt` is proper names and speaking style given to the model as context before
+    the recording (whisper.cpp's `initial_prompt`) — without it the dictation loses
+    "Klodzio", "Gienia", "kibelek". `carry_initial_prompt` and `max_len` go to
+    whisper.cpp the same way (dictation fields); empty ones are not sent at all.
     """
     uploaded_ext = Path(file.filename or "").suffix.lower()
     file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
@@ -66,9 +65,9 @@ async def transcribe_audio(
             await asyncio.to_thread(save_audio, audio, stt_path, sr)
 
         whisper_model = transcribe.get_whisper_model()
-        # whisper.cpp: bez `model` bierzemy wybor z PANELU, nie to, co akurat
-        # siedzi w procesie — dyktafon ma chodzic na tym, co ustawione.
-        model_size = model or getattr(whisper_model, "wybrany_rozmiar", None) or whisper_model.model_size
+        # whisper.cpp: without `model` we take the PANEL's choice, not whatever happens
+        # to sit in the process — the dictation has to run on what is set.
+        model_size = model or getattr(whisper_model, "selected_size", None) or whisper_model.model_size
 
         valid_sizes = list(WHISPER_HF_REPOS.keys())
         if model_size not in valid_sizes:
@@ -101,19 +100,19 @@ async def transcribe_audio(
                 },
             )
 
-        # Nie kazdy backend STT zna te pola (MLX, PyTorch ich nie maja), a
-        # Protocol ma staly ksztalt — wiec pytamy sygnatury, zamiast zgadywac.
-        znane = inspect.signature(whisper_model.transcribe).parameters
-        dodatki = {
+        # The STT Protocol has a fixed shape and not every backend has to know these
+        # fields — so we ask the signature instead of guessing.
+        known = inspect.signature(whisper_model.transcribe).parameters
+        extras = {
             k: v
             for k, v in (
                 ("prompt", prompt),
                 ("carry_initial_prompt", carry_initial_prompt),
                 ("max_len", max_len),
             )
-            if v not in (None, "") and k in znane
+            if v not in (None, "") and k in known
         }
-        text = await whisper_model.transcribe(stt_path, language, model_size, **dodatki)
+        text = await whisper_model.transcribe(stt_path, language, model_size, **extras)
 
         return models.TranscriptionResponse(
             text=text,

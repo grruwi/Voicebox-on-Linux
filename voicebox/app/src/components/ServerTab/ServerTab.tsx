@@ -43,8 +43,8 @@ export function SettingsLayout() {
         {tabs.map((tab) => {
           if (tab.tauriOnly && !platform.metadata.isTauri) return null;
 
-          // General ma teraz wlasna sciezke `/settings/general`, wiec nie trzeba
-          // juz chronic go przed dopasowaniem rozmytym do wszystkich podzakladek.
+          // General has its own path `/settings/general` now, so it no longer needs
+          // protecting from fuzzy-matching every sub-tab.
           const isActive = matchRoute({ to: tab.path });
 
           return (

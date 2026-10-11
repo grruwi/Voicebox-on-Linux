@@ -64,16 +64,13 @@ def register_tools(mcp: FastMCP) -> None:
         ``default_personality`` flag decides; when that is unset, the
         default is plain TTS.
 
-        ``model_size`` selects a model variant for engines that ship more
-        than one — ``qwen`` and ``qwen_custom_voice`` accept "1.7B" (default)
-        or "0.6B"; ``tada`` accepts "1B" or "3B". Other engines ignore it.
-        Omit to use the engine default. Requesting a smaller variant (e.g.
-        "0.6B") is faster and avoids reloading a heavier model between calls.
+        ``engine`` overrides the profile's engine: ``voxcpm`` (VoxCPM2 on
+        audio.cpp), ``voxcpm_pt`` (VoxCPM2 on PyTorch) or ``omnivoice``.
+        Omit to use the client binding's engine, then the profile's.
 
-        ``voice`` picks a built-in voice on engines that ship a fixed set of
-        them, overriding the one stored in the profile — ``supertonic`` accepts
-        "M1".."M5" and "F1".."F5". Cloning engines ignore it. Omit to use the
-        profile's own voice.
+        ``model_size`` and ``voice`` are kept for compatibility: every engine
+        of this build has a single variant and no built-in voices, so both
+        are ignored.
         """
         from ..database.models import MCPClientBinding
 
@@ -259,27 +256,27 @@ async def _speak(
     # model_size=None is intentional: generate_speech normalizes it to the
     # engine default (see routes/generations.py), so an omitted size behaves
     # exactly like the REST /generate endpoint with no model_size in the body.
-    # ⚠️ `normalize` MUSI byc przekazane jawnie. Pole ma w Pydanticu
-    # `default=True`, wiec pominiete znaczylo „normalizuj" — niezaleznie od
-    # przelacznika „Normalize audio" w GUI. Front go czyta i wysyla, ta sciezka
-    # nie czytala, wiec mowa agenta byla normalizowana MIMO wylaczonego suwaka.
-    # Objaw: sciety zakres dynamiki tylko w tym, co mowi agent.
+    # ⚠️ `normalize` MUST be passed explicitly. In Pydantic the field has
+    # `default=True`, so leaving it out meant "normalize" — whatever the
+    # "Normalize audio" switch in the GUI said. The frontend reads and sends it;
+    # this path did not, so the agent's speech was normalized DESPITE the switch
+    # being off. Symptom: a squashed dynamic range only in what the agent says.
     from ..database.models import GenerationSettings
 
-    # ⚠️ To samo dotyczy `max_chunk_chars` i `crossfade_ms` — Pydantic ma tam
-    # 800 i 50 ms, wiec mowa agenta byla ciachana i sklejana z przenikaniem
-    # NIEZALEZNIE od suwakow w panelu. Objaw: szew w srodku zdania powyzej
-    # 800 znakow, mimo ustawionych 1400. `None` = nie przekazuj pola wcale,
-    # niech default zostanie defaultem.
-    normalizuj = True
+    # ⚠️ The same goes for `max_chunk_chars` and `crossfade_ms` — Pydantic has 800
+    # and 50 ms there, so the agent's speech was cut and stitched with a crossfade
+    # REGARDLESS of the panel's sliders. Symptom: a seam mid-sentence above 800
+    # characters, despite 1400 being set. `None` = do not pass the field at all,
+    # let the default stay the default.
+    normalize = True
     chunk = None
     crossfade = None
     try:
-        ustawienia = db.query(GenerationSettings).first()
-        if ustawienia is not None:
-            normalizuj = bool(ustawienia.normalize_audio)
-            chunk = ustawienia.max_chunk_chars
-            crossfade = ustawienia.crossfade_ms
+        settings = db.query(GenerationSettings).first()
+        if settings is not None:
+            normalize = bool(settings.normalize_audio)
+            chunk = settings.max_chunk_chars
+            crossfade = settings.crossfade_ms
     except Exception:
         pass
 
@@ -291,7 +288,7 @@ async def _speak(
         personality=personality,
         model_size=model_size,
         preset_voice_id=preset_voice_id,
-        normalize=normalizuj,
+        normalize=normalize,
         **({"max_chunk_chars": chunk} if chunk is not None else {}),
         **({"crossfade_ms": crossfade} if crossfade is not None else {}),
     )
@@ -338,13 +335,13 @@ def _speak_response(
 async def _transcribe_file(
     path: Path, language: str | None, model: str | None
 ) -> dict[str, Any]:
-    from ..backends import WHISPER_HF_REPOS
     from ..services import transcribe as transcribe_service
+    from ..services import whisper_host
     from ..utils.audio import load_audio
 
     whisper = transcribe_service.get_whisper_model()
     model_size = model or whisper.model_size
-    valid = list(WHISPER_HF_REPOS.keys())
+    valid = list(whisper_host.MODELS)
     if model_size not in valid:
         raise ValueError(
             f"Invalid STT model '{model_size}'. Must be one of: {', '.join(valid)}"
@@ -358,8 +355,8 @@ async def _transcribe_file(
         not whisper.is_loaded() or whisper.model_size != model_size
     ) and not whisper._is_model_cached(model_size):
         raise ValueError(
-            f"Whisper model '{model_size}' is not yet downloaded. Open "
-            "Voicebox → Settings → Models to download it first."
+            f"Whisper model '{model_size}' is not on disk — run "
+            "download-models.sh (Voicebox downloads nothing itself)."
         )
 
     text = await whisper.transcribe(str(path), language, model_size)
