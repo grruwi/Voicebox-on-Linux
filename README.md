@@ -211,11 +211,12 @@ whole file at the end instead.
 
 ## What changed against the upstreams
 
-- `audiocpp/voicebox.patch` — 12 patches on audio.cpp @ `497c7f0`:
+- `audiocpp/voicebox.patch` — 13 patches on audio.cpp @ `497c7f0`:
   - stateful AudioVAE stream decoder; upsample weights rewritten once at load (decoder 36 → 3.6 ms/chunk);
   - LM KV cache in F16 + flash attention on views; prefill state stays on the card;
   - f32 output (`sample_format`);
-  - on-disk cache of encoded voice samples (profile change 2.4 s → 4 ms);
+  - on-disk cache of encoded voice samples — Vox (profile change 2.4 s → 4 ms) and OmniVoice
+    (its tokenizer is cheap: ~70 ms);
   - no LM graph rebuild per request; prefill on flash attention + one-graph text embed
     (first sound 276 → 170 ms);
   - fast load of prebuilt weight files (7 → 1.75 s); a separate BaseLM precision.
